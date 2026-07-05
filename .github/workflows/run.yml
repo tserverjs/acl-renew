@@ -1,9 +1,9 @@
 name: Kerit Cloud Login with CloakBrowser
 
 on:
-  workflow_dispatch: # 支持手动点击运行
+  workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *' # 每天早上 8 点自动挂机运行
+    - cron: '0 8 * * *'
 
 jobs:
   run-stealth-login:
@@ -15,22 +15,23 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11' # 保持你项目标准的 Python 3.11 环境
+        python-version: '3.11'
 
     - name: 📦 安装系统底层依赖
       run: |
         sudo apt-get update -y
-        # 1. 自动接受微软字体受体协议
+        # 自动接受微软字体受体协议
         echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | sudo debconf-set-selections
-        # 2. 安装系统底层依赖和微软核心字体库
+        # 安装系统依赖和字体
         sudo apt-get install -y \
           xvfb curl wget wmctrl ffmpeg scrot \
           fonts-noto-color-emoji xdotool \
-          x11-utils x11-xserver-utils ttf-mscorefonts-installer
-        # 3. 刷新系统字体缓存
+          x11-utils x11-xserver-utils ttf-mscorefonts-installer \
+          libnss3 libatk-bridge2.0-0 libxss1 libgtk-3-0
+        # 刷新字体缓存
         sudo fc-cache -f -v
 
-    - name: 🌐 启动GOST代理
+    - name: 🌐 启动 GOST 代理隧道
       env:
         GOST_PROXY: ${{ secrets.GOST_PROXY }}
       run: |
@@ -52,55 +53,85 @@ jobs:
     - name: Install Python Dependencies
       run: |
         pip install cloakbrowser
+        # 可选：安装 geoip 支持（cloakbrowser 会自动用时区匹配代理IP）
+        # pip install cloakbrowser[geoip]
 
-    - name: 🎬 开启虚拟桌面与视频录制监控
+    - name: 🎬 启动虚拟桌面并执行自动化
       env:
         DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
       run: |
-        # 1. 建立虚拟屏幕 (注入 -extension RANDR 允许高级窗口管理器控制)
+        # 1. 建立虚拟屏幕（RANDR 扩展支持窗口管理）
         Xvfb :99 -ac -screen 0 1920x1080x24 +extension RANDR > /dev/null 2>&1 &
         sleep 3
         
-        # 2. 全局声明环境变量
         export DISPLAY=:99
         
-        # 3. 启动 ffmpeg 进行桌面捕获
+        # 2. 启动 ffmpeg 屏幕录制
         echo "🎥 正在初始化屏幕录像机..."
-        DISPLAY=:99 ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 -codec:v libx264 -pix_fmt yuv420p cloak_run_record.mp4 > ffmpeg.log 2>&1 &
+        DISPLAY=:99 ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 \
+          -codec:v libx264 -pix_fmt yuv420p -r 30 \
+          cloak_run_record.mp4 > ffmpeg.log 2>&1 &
         FFMPEG_PID=$!
         sleep 2
 
-        # 4. 后台窗口最大化守护进程（扩大扫描周期至 30 秒，确保捕获到 Headed 浏览器）
+        # 3. 窗口最大化守护进程（持续扫描浏览器窗口）
         (
           export DISPLAY=:99
-          for i in {1..30}; do
+          for i in {1..60}; do
             sleep 1
-            if wmctrl -l 2>/dev/null | grep -iE "chrome|chromium|cloak|kerit" > /dev/null; then
-              echo "🎯 成功捕获到物理浏览器窗口，正在执行全屏最大化..."
-              wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz || true
+            # 扫描 Chrome/Chromium/CloakBrowser 窗口
+            WINDOW_ID=$(wmctrl -l 2>/dev/null | grep -iE "chrome|chromium|cloak" | head -1 | awk '{print $1}')
+            if [ -n "$WINDOW_ID" ]; then
+              echo "🎯 捕获到浏览器窗口 $WINDOW_ID，执行最大化..."
+              wmctrl -i -r "$WINDOW_ID" -b add,maximized_vert,maximized_horz 2>/dev/null || true
+              # 同时尝试激活窗口
+              wmctrl -i -a "$WINDOW_ID" 2>/dev/null || true
               break
             fi
           done
         ) &
 
-        # 5. 执行核心自动化登录脚本
+        # 4. 执行核心脚本
         echo "🚀 开始运行 CloakBrowser 自动化脚本..."
         python auto-renew.py || touch .script_failed
 
-        # 6. 优雅停止录像
+        # 5. 优雅停止录像
         echo "🛑 脚本运行完毕，正在保存录像..."
-        kill -SIGINT $FFMPEG_PID
+        kill -SIGINT $FFMPEG_PID 2>/dev/null || true
         sleep 3
+        # 确保 ffmpeg 已退出
+        kill $FFMPEG_PID 2>/dev/null || true
+        sleep 1
 
         if [ -f .script_failed ]; then
-          echo "❌ 脚本执行遭遇异常，请检查下载的录像。"
+          echo "❌ 脚本执行遭遇异常，请检查下载的录像和截图。"
           exit 1
         fi
 
-    - name: 📦 上传操作录像视频
-      if: always() # 无论成功还是失败，都强制上传录像供排查
+    - name: 📦 上传操作录像（无论成败）
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: execution-video-record
         path: cloak_run_record.mp4
         retention-days: 7
+
+    - name: 📦 上传调试截图（无论成败）
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-screenshots
+        path: |
+          debug_*.png
+          error_*.png
+        retention-days: 7
+
+    - name: 📦 上传持久化配置（成功时）
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kerit-auth-state
+        path: |
+          kerit_auth.json
+          cloak-profile/
+        retention-days: 30
