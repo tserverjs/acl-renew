@@ -1,4 +1,4 @@
-name: Kerit Cloud Login with CloakBrowser
+name: Kerit Cloud Renew with CloakBrowser
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
         tar -xzf gost_${VERSION}_linux_amd64.tar.gz
         chmod +x ./gost
         nohup ./gost -L socks5://:40000 -F "${GOST_PROXY}" > gost-proxy.log 2>&1 &
-        
+
         echo "⏳ 等待代理隧道建立..."
         for i in {1..30}; do
           sleep 1
@@ -48,7 +48,7 @@ jobs:
           fi
           echo "  第 $i 秒等待中..."
         done
-        
+
         if [ -z "${EXIT_IP}" ]; then
           echo "❌ 代理隧道连接失败"
           cat gost-proxy.log
@@ -61,13 +61,14 @@ jobs:
 
     - name: 🎬 启动虚拟桌面并执行自动化
       env:
-        DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+        KERIT_ACCOUNT: ${{ secrets.KERIT_ACCOUNT }}
+        WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
       run: |
         Xvfb :99 -ac -screen 0 1920x1080x24 +extension RANDR > /dev/null 2>&1 &
         sleep 3
-        
+
         export DISPLAY=:99
-        
+
         echo "🎥 正在初始化屏幕录像机..."
         DISPLAY=:99 ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 \
           -codec:v libx264 -pix_fmt yuv420p -r 30 \
@@ -120,6 +121,10 @@ jobs:
         path: |
           debug_*.png
           error_*.png
+          turnstile_*.png
+          kerit_*.png
+          renew_*.png
+          no_*.png
         retention-days: 7
 
     - name: 📦 上传持久化配置（成功时）
