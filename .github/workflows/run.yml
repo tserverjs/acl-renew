@@ -57,12 +57,12 @@ jobs:
 
     - name: Install Python Dependencies
       run: |
-        pip install cloakbrowser
+        pip install cloakbrowser 
 
     - name: 🎬 启动虚拟桌面并执行自动化
       env:
         KERIT_ACCOUNT: ${{ secrets.KERIT_ACCOUNT }}
-        WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK }}
+        WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
       run: |
         Xvfb :99 -ac -screen 0 1920x1080x24 +extension RANDR > /dev/null 2>&1 &
         sleep 3
