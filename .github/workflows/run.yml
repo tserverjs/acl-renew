@@ -65,19 +65,29 @@ jobs:
         KERIT_ACCOUNT: ${{ secrets.KERIT_ACCOUNT }}
         WECHAT_KEY: ${{ secrets.WECHAT_WEBHOOK }}
       run: |
+        # 1. 启动虚拟桌面
         Xvfb :99 -ac -screen 0 1920x1080x24 +extension RANDR > /dev/null 2>&1 &
         sleep 3
         
         export DISPLAY=:99
         
+        # 2. 初始化屏幕录像机
         echo "🎥 正在初始化屏幕录像机..."
         ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 \
           -codec:v libx264 -pix_fmt yuv420p -r 30 \
           cloak_run_record.mp4 > ffmpeg.log 2>&1 &
         FFMPEG_PID=$!
-        sleep 3
+        sleep 2
 
-        # 窗口最大化守护进程
+        # 3. ── 通过命令行拉起 CloakBrowser 并注入代理 ──
+        echo "🌐 正在从命令行启动 CloakBrowser..."
+        cloakbrowser --remote-debugging-port=9222 --proxy-server="socks5://127.0.0.1:40000" --no-sandbox > cloakbrowser.log 2>&1 &
+        
+        # ⏳ 核心防摔：强制等待 6 秒，让浏览器完全在 9222 端口把 CDP 备好
+        echo "⏳ 等待 CloakBrowser 端口就绪..."
+        sleep 6
+
+        # 4. 窗口最大化守护进程
         (
           export DISPLAY=:99
           for i in {1..60}; do
@@ -92,11 +102,14 @@ jobs:
           done
         ) &
 
+        # 5. 运行 Python 脚本
         echo "🚀 开始运行 CloakBrowser 自动化脚本..."
         python auto-renew.py || touch .script_failed
 
+        # 6. 录像善后并清理后台浏览器
         echo "🛑 脚本运行完毕，正在保存录像..."
         kill -SIGINT $FFMPEG_PID 2>/dev/null || true
+        pkill -f cloakbrowser || true
         sleep 3
         kill $FFMPEG_PID 2>/dev/null || true
         sleep 1
