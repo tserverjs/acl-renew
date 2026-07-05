@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-# 注意：同步模式下，虽然 CloakBrowser 替换了 Playwright，但我们依然可以直接使用它的同步 API
 from cloakbrowser import launch 
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
@@ -12,26 +11,23 @@ def main():
         print("[错误] 未配置 DISCORD_TOKEN 环境变量！")
         sys.exit(1)
 
-    print("🚀 正在启动 CloakBrowser (纯同步模式 + 住宅代理 + 内核最大化)...")
+    print("🚀 正在启动 CloakBrowser (Headed 真实桌面渲染模式 + GOST 代理)...")
     
-    # 移除 await，直接同步 launch
+    # 🌟 核心修正：headless 必须为 False！让魔改内核把画面渲染到 Xvfb 的虚拟桌面上
     browser = launch(
-        headless=True,
+        headless=False, 
         humanize=True,
-        proxy={"server": LOCAL_SOCKS5},
-        args=[
-            "--start-maximized",        
-            "--window-size=1920,1080"   
-        ]
+        proxy={"server": LOCAL_SOCKS5}
     )
     
+    # 设置一个标准的 1080P 铺满视口
     context = browser.new_context(viewport={"width": 1920, "height": 1080})
     page = context.new_page()
 
     try:
         print("正在打开 Kerit 登录页...")
         page.goto("https://billing.kerit.cloud/login")
-        time.sleep(4)
+        time.sleep(5)
 
         print("尝试寻找并点击 Discord 登录链接...")
         try:
@@ -40,7 +36,8 @@ def main():
             page.evaluate("document.querySelector('a[href*=\"discord\"]')?.click();")
         
         print("正在等待跳转至 Discord 授权域...")
-        page.wait_for_url("**/discord.com/**", timeout=25000)
+        # 将超时时间放宽至 40 秒，给住宅代理留足缓冲时间
+        page.wait_for_url("**/discord.com/**", timeout=40000)
         time.sleep(5)
 
         print("已成功切入 Discord 域，开始强行注入 Token 凭据...")
@@ -89,7 +86,6 @@ def main():
         page.wait_for_url("**/clientarea.php*", timeout=40000)
         print("🎉 [完美通关] 成功通过 CloakBrowser 登录进后台！")
         
-        # 成功登录后备份状态
         context.storage_state(path="kerit_auth.json")
         print("已同步将会话状态保存至 kerit_auth.json")
 
