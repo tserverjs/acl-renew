@@ -7,47 +7,47 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 LOCAL_SOCKS5 = "socks5://127.0.0.1:40000"
 
 def solve_cloudflare_turnstile(page):
-    """专门穿透 iframe 并点击 Cloudflare Turnstile 复选框"""
-    print("⏳ 正在检测页面中是否存在 Cloudflare Turnstile 验证码...")
+    """深入 Iframe 内部精准定位并点击 Turnstile 复选框"""
+    print("⏳ 正在扫描页面底层 DOM 结构...")
+    time.sleep(5) # 留出缓冲时间让 Cloudflare 完成初始化
     
-    # 留出 8 秒时间让 Cloudflare 尝试静默过验或加载出验证框
-    time.sleep(8)
+    # 核心定位器：锁定 Cloudflare 验证码的特征 Iframe
+    iframe_selector = "iframe[src*='challenges.cloudflare.com']"
     
-    # 检查是否还在挑战页
-    if "Performance security verification" in page.content() or "cf-challenge" in page.url or page.locator("iframe[src*='challenges']").count() > 0:
-        print("🔒 触发 Cloudflare 显式挑战，尝试定位验证框...")
+    if page.locator(iframe_selector).count() > 0:
+        print("🔒 确凿检测到 Cloudflare Turnstile 显式挑战框！准备执行穿透点击...")
         try:
-            # 1. 找到 Turnstile 的安全 iframe
-            turnstile_iframe = page.wait_for_selector("iframe[src*='challenges.cloudflare.com']", timeout=15000)
-            if turnstile_iframe:
-                print("🎯 已锁定 Turnstile 核心 Iframe，正在计算复选框物理绝对坐标...")
+            # 1. 定位到该 iframe 上下文
+            cf_frame = page.frame_locator(iframe_selector)
+            
+            # 2. 在 iframe 内部寻找复选框容器或点击区域
+            # Turnstile 内部的点击目标通常是 #challenge-stage 或里面的 checkbox 元素
+            checkbox = cf_frame.locator("#challenge-stage, input[type='checkbox'], .mark")
+            
+            if checkbox.count() > 0:
+                print("🎯 已成功锁定 Iframe 内部的复选框目标，正在模拟人类点击...")
+                # 使用 click 会自动触发 CloakBrowser 的拟人化贝塞尔曲线轨迹和时序
+                checkbox.first.click(timeout=10000)
+                print("⏳ 点击指令已发送，给予 15 秒等待放行期...")
+                time.sleep(15)
+            else:
+                print("⚠️ 找到了 Iframe，但未探测到内部的有效点击元素，尝试直接对其中心施加模拟点击...")
+                # 兜底：对整个 iframe 容器进行点击
+                page.locator(iframe_selector).first.click()
+                time.sleep(15)
                 
-                # 获取该 iframe 的相对屏幕位置和大小
-                box = turnstile_iframe.bounding_box()
-                if box:
-                    # 复选框一般在 iframe 的偏左侧 (比如宽度的 15% 处，高度的 50% 居中处)
-                    click_x = box["x"] + 30
-                    click_y = box["y"] + box["height"] / 2
-                    
-                    print(f"🖱️ 拟人化鼠标正在精准移动至物理坐标: ({click_x}, {click_y}) 并实施点击...")
-                    page.mouse.move(click_x, click_y, steps=10)
-                    page.mouse.click(click_x, click_y)
-                    
-                    print("⏳ 点击完毕，等待 Cloudflare 验证通过 (15秒放行期)...")
-                    time.sleep(15)
         except Exception as e:
-            print(f"⚠️ 尝试点击 Turnstile 框时发生异常 (可能已静默过验): {str(e)}")
+            print(f"⚠️ 穿透点击过程中发生异常: {str(e)}")
     else:
-        print("✅ 完美！系统指纹过关，Cloudflare 未弹出显式验证码，直接进入了登录页。")
+        print("❓ 未在当前层级发现显式挑战框，可能处于静默流或已被指纹混淆通过。")
 
 def main():
     if not DISCORD_TOKEN:
         print("[错误] 未配置 DISCORD_TOKEN 环境变量！")
         sys.exit(1)
 
-    print("🚀 正在启动 CloakBrowser (Headed 真实桌面渲染模式 + GOST 代理)...")
+    print("🚀 正在启动 CloakBrowser (Headed 真实桌面渲染 + 拟人化引擎)...")
     
-    # 抑制没有 Windows 字体的警告（如果上面工作流安装成功，这里指纹就已经完美了）
     os.environ["CLOAKBROWSER_SUPPRESS_FONT_WARNING"] = "1"
     
     browser = launch(
@@ -63,16 +63,19 @@ def main():
         print("正在打开 Kerit 登录页...")
         page.goto("https://billing.kerit.cloud/login")
         
-        # 🌟 核心拦截：在此处强行注入过验逻辑
+        # 🌟 触发精准穿透点击
         solve_cloudflare_turnstile(page)
+
+        print("正在检查页面是否已解密成功...")
+        time.sleep(5)
 
         print("尝试寻找并点击 Discord 登录链接...")
         try:
-            # 重新确认一次元素是否可点击
+            # 显式等待按钮出现，防止超前点击
             page.wait_for_selector('a:has-text("Discord"), button:has-text("Discord"), a[href*="discord"]', timeout=15000)
             page.click('a:has-text("Discord"), button:has-text("Discord")')
-        except:
-            print("📟 按钮未就绪，尝试使用 JS 强制破门机制触发点击...")
+        except Exception as e:
+            print(f"📟 标准按钮未就绪 ({str(e)})，执行强行破门机制...")
             page.evaluate("document.querySelector('a[href*=\"discord\"]')?.click();")
         
         print("正在等待跳转至 Discord 授权域...")
