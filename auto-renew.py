@@ -7,7 +7,6 @@ import urllib.request
 import urllib.parse
 import json
 from playwright.sync_api import sync_playwright
-from cloakbrowser import CloakBrowser
 
 # ============================================================
 # 配置与解析环境
@@ -228,145 +227,146 @@ def do_renew(page):
 # 主控入口
 # ============================================================
 def main():
-    print("🚀 启动 CloakBrowser 托管进程...")
-    
-    # 采用 Python 内部生命周期管理，解决 ECONNREFUSED 搶跑问题
-    cloak = CloakBrowser(
-        proxy_server="socks5://127.0.0.1:40000",
-        keep_window=True
-    )
-    cloak.start()
-    print("✅ CloakBrowser 隐匿环境完全就绪")
+    print("🚀 启动自动化流...")
 
-    try:
-        with sync_playwright() as p:
-            print("🔗 连接 Playwright 至本地 CDP 调试端口...")
-            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else context.new_page()
-
-            # IP 验证
+    with sync_playwright() as p:
+        print("🔗 正在尝试连接 CloakBrowser 调试端口 (127.0.0.1:9222)...")
+        browser = None
+        
+        # 增加主动重试探针，完美避开 ECONNREFUSED
+        for attempt in range(6):
             try:
-                page.goto("https://api.ipify.org/?format=json", timeout=15000)
-                print(f"🌐 节点真实出口 IP: {page.locator('body').text_content()}")
-            except Exception:
-                print("⚠️ IP 基础检测请求超时，跳过")
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                print("✅ 成功连接至 CloakBrowser！")
+                break
+            except Exception as e:
+                if attempt == 5:
+                    print("❌ 重试结束，无法连接到浏览器调试端口。")
+                    raise e
+                print(f"⚠️ 端口尚未完全释放或处于就绪中，5秒后重试... ({attempt + 1}/6)")
+                time.sleep(5)
 
-            # 登录业务流
-            print("🔑 正在定位至登录页...")
-            page.goto(LOGIN_URL)
-            page.wait_for_timeout(3000)
+        context = browser.contexts[0]
+        page = context.pages[0] if context.pages else context.new_page()
 
-            # Turnstile 自动化阻尼器
-            for _ in range(15):
-                if page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]') !== null"):
-                    print("🛡️ 捕捉到 Cloudflare Turnstile 人机挑战，交由 Cloak 后台静默通关...")
-                    page.wait_for_timeout(2000)
-                else:
-                    break
+        # IP 验证
+        try:
+            page.goto("https://api.ipify.org/?format=json", timeout=15000)
+            print(f"🌐 节点真实出口 IP: {page.locator('body').text_content()}")
+        except Exception:
+            print("⚠️ IP 基础检测请求超时，跳过")
 
-            try:
-                page.wait_for_selector('#email-input', state='visible', timeout=20000)
-            except Exception:
-                print("❌ 目标页面加载异常，未找到账户输入框")
-                page.screenshot(path="kerit_err_no_email.png")
-                return
+        # 登录业务流
+        print("🔑 正在定位至登录页...")
+        page.goto(LOGIN_URL)
+        page.wait_for_timeout(3000)
 
-            page.fill('#email-input', KERIT_EMAIL)
-            print(f"📝 已注入登录邮箱: {MASKED_EMAIL}")
-
-            # 强点击逻辑
-            clicked = False
-            for selector in ['button:has-text("Continue with Email")', 'button[type="submit"]', 'form button']:
-                try:
-                    if page.locator(selector).is_visible():
-                        page.locator(selector).click(timeout=5000)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
-            if not clicked:
-                print("❌ 点击提交失败，按钮未能识别")
-                page.screenshot(path="kerit_err_no_submit.png")
-                return
-
-            print("⏳ 强制硬停滞 4 秒，等待 DOM 重塑...")
-            page.wait_for_timeout(4000)
-
-            # 多维特征兼容型 OTP 选择器探针
-            otp_selector = 'input[class*="otp"], input[id*="otp"], input[maxlength="1"], input[type="text"]'
-            try:
-                page.wait_for_selector(otp_selector, state='visible', timeout=25000)
-                print("🎯 OTP 输入载体捕获成功")
-            except Exception:
-                if page.locator('input').first.is_visible():
-                    print("⚠️ 属性被混淆，启用页面盲盒输入模式")
-                else:
-                    print("❌ 未捕获到任何输入控件")
-                    page.screenshot(path="kerit_err_no_otp_box.png")
-                    return
-
-            # 获取并填入 OTP
-            code = fetch_otp_from_gmail(wait_seconds=60)
-            print(f"⌨️ 正在灌注验证码: {code}")
-
-            # 序列无依赖底层 JavaScript 直接填入法
-            js_fill_otp = f"""
-                (function() {{
-                    var inputs = Array.from(document.querySelectorAll('input')).filter(el => {{
-                        var style = window.getComputedStyle(el);
-                        return style.display !== 'none' && style.visibility !== 'hidden' && el.type !== 'hidden';
-                    }});
-                    if (inputs.length < 4) inputs = Array.from(document.querySelectorAll('input'));
-                    var codeStr = '{code}';
-                    for (var i = 0; i < Math.min(codeStr.length, inputs.length); i++) {{
-                        var inp = inputs[i];
-                        var char = codeStr[i];
-                        inp.focus();
-                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        nativeInputValueSetter.call(inp, char);
-                        inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }}
-                }})();
-            """
-            page.evaluate(js_fill_otp)
-            page.wait_for_timeout(500)
-
-            # 确认验证
-            verify_clicked = False
-            for selector in ['button:has-text("Verify Code")', 'button[type="submit"]', 'form button.btn-primary']:
-                try:
-                    if page.locator(selector).is_visible():
-                        page.locator(selector).click(timeout=5000)
-                        verify_clicked = True
-                        break
-                except Exception:
-                    continue
-
-            if not verify_clicked:
-                print("❌ 无法提交验证，缺失确认按钮")
-                page.screenshot(path="kerit_err_no_verify.png")
-                return
-
-            print("⏳ 正在等待重定向会话授权...")
-            for _ in range(60):
-                if "/session" in page.url or "/free_panel" in page.url:
-                    print("🎉 突破防线，成功鉴权登录！")
-                    break
-                page.wait_for_timeout(500)
+        # Turnstile 自动化阻尼器
+        for _ in range(15):
+            if page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]') !== null"):
+                print("🛡️ 捕捉到 Cloudflare Turnstile 人机挑战，交由 Cloak 后台静默通关...")
+                page.wait_for_timeout(2000)
             else:
-                print("❌ 登录跳转超时")
-                page.screenshot(path="kerit_err_login_timeout.png")
+                break
+
+        try:
+            page.wait_for_selector('#email-input', state='visible', timeout=20000)
+        except Exception:
+            print("❌ 目标页面加载异常，未找到账户输入框")
+            page.screenshot(path="kerit_err_no_email.png")
+            return
+
+        page.fill('#email-input', KERIT_EMAIL)
+        print(f"📝 已注入登录邮箱: {MASKED_EMAIL}")
+
+        # 强点击逻辑
+        clicked = False
+        for selector in ['button:has-text("Continue with Email")', 'button[type="submit"]', 'form button']:
+            try:
+                if page.locator(selector).is_visible():
+                    page.locator(selector).click(timeout=5000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            print("❌ 点击提交失败，按钮未能识别")
+            page.screenshot(path="kerit_err_no_submit.png")
+            return
+
+        print("⏳ 强制硬停滞 4秒，等待 DOM 重塑...")
+        page.wait_for_timeout(4000)
+
+        # 多维特征兼容型 OTP 选择器探针
+        otp_selector = 'input[class*="otp"], input[id*="otp"], input[maxlength="1"], input[type="text"]'
+        try:
+            page.wait_for_selector(otp_selector, state='visible', timeout=25000)
+            print("🎯 OTP 输入载体捕获成功")
+        except Exception:
+            if page.locator('input').first.is_visible():
+                print("⚠️ 属性被混淆，启用页面盲盒输入模式")
+            else:
+                print("❌ 未捕获到任何输入控件")
+                page.screenshot(path="kerit_err_no_otp_box.png")
                 return
 
-            # 续期执行体
-            do_renew(page)
+        # 获取并填入 OTP
+        code = fetch_otp_from_gmail(wait_seconds=60)
+        print(f"⌨️ 正在灌注验证码: {code}")
 
-    finally:
-        print("🧹 销毁 Cloak 浏览器拓扑上下文...")
-        cloak.stop()
+        # 序列无依赖底层 JavaScript 直接填入法
+        js_fill_otp = f"""
+            (function() {{
+                var inputs = Array.from(document.querySelectorAll('input')).filter(el => {{
+                    var style = window.getComputedStyle(el);
+                    return style.display !== 'none' && style.visibility !== 'hidden' && el.type !== 'hidden';
+                }});
+                if (inputs.length < 4) inputs = Array.from(document.querySelectorAll('input'));
+                var codeStr = '{code}';
+                for (var i = 0; i < Math.min(codeStr.length, inputs.length); i++) {{
+                    var inp = inputs[i];
+                    var char = codeStr[i];
+                    inp.focus();
+                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(inp, char);
+                    inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+            }})();
+        """
+        page.evaluate(js_fill_otp)
+        page.wait_for_timeout(500)
+
+        # 确认验证
+        verify_clicked = False
+        for selector in ['button:has-text("Verify Code")', 'button[type="submit"]', 'form button.btn-primary']:
+            try:
+                if page.locator(selector).is_visible():
+                    page.locator(selector).click(timeout=5000)
+                    verify_clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not verify_clicked:
+            print("❌ 无法提交验证，缺失确认按钮")
+            page.screenshot(path="kerit_err_no_verify.png")
+            return
+
+        print("⏳ 正在等待重定向会话授权...")
+        for _ in range(60):
+            if "/session" in page.url or "/free_panel" in page.url:
+                print("🎉 突破防线，成功鉴权登录！")
+                break
+            page.wait_for_timeout(500)
+        else:
+            print("❌ 登录跳转超时")
+            page.screenshot(path="kerit_err_login_timeout.png")
+            return
+
+        # 续期执行体
+        do_renew(page)
 
 if __name__ == "__main__":
     main()
