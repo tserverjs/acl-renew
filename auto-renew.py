@@ -27,7 +27,7 @@ LOGIN_URL      = "https://billing.kerit.cloud/"
 FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 
 # 企业微信机器人配置
-WECHAT_WEBHOOK = os.environ.get("WECHAT_WEBHOOK", "")
+WECHAT_WEBHOOK = os.environ.get("WECHAT_WEBHOOK_KEY", "")
 
 
 # ============================================================
@@ -42,31 +42,25 @@ def send_wechat(result, server_id=None, remaining=None):
     if not WECHAT_WEBHOOK:
         print("⚠️ 企业微信未配置，跳过推送")
         return
-    
+
+    # 构建纯文本消息
     lines = [
-        f"🎮 <font color='info'>Kerit 服务器续期通知</font>",
-        f"🕐 运行时间: {now_str()}",
+        "【Kerit 服务器续期通知】",
+        f"运行时间: {now_str()}",
     ]
     if server_id is not None:
-        lines.append(f"🖥 服务器ID: {server_id}")
-    
-    # 根据结果设置颜色
-    if "成功" in result or "✅" in result:
-        color = "info"
-    elif "失败" in result or "❌" in result:
-        color = "warning"
-    else:
-        color = "comment"
-    
-    lines.append(f"📊 续期结果: <font color='{color}'>{result}</font>")
+        lines.append(f"服务器ID: {server_id}")
+
+    lines.append(f"续期结果: {result}")
     if remaining is not None:
-        lines.append(f"⏱️ 剩余天数: {remaining}天")
-    
-    msg = "\n".join(lines)
-    
+        lines.append(f"剩余天数: {remaining}天")
+
+    msg = "
+".join(lines)
+
     payload = {
-        "msgtype": "markdown",
-        "markdown": {
+        "msgtype": "text",
+        "text": {
             "content": msg
         }
     }
@@ -635,6 +629,11 @@ def main():
 
         print("🖱️ 点击继续...")
         clicked = False
+
+        # 先等待按钮可点击
+        page.wait_for_load_state('networkidle', timeout=15000)
+        time.sleep(1)
+
         for selector in [
             'button:has-text("Continue with Email")',
             'a:has-text("Continue with Email")',
@@ -642,18 +641,22 @@ def main():
         ]:
             try:
                 if page.locator(selector).count() > 0:
-                    page.click(selector, timeout=10000)
+                    page.locator(selector).first.click(timeout=10000)
                     clicked = True
+                    print(f"✅ 通过选择器点击成功: {selector}")
                     break
-            except Exception:
+            except Exception as e:
+                print(f"  选择器 {selector} 失败: {e}")
                 continue
 
         if not clicked:
+            # 使用 JavaScript 点击
             result = page.evaluate("""() => {
                 const buttons = Array.from(document.querySelectorAll('button, a'));
                 for (const btn of buttons) {
-                    if (btn.textContent.toLowerCase().includes('continue with email') || 
-                        btn.textContent.toLowerCase().includes('continue')) {
+                    const text = btn.textContent.trim().toLowerCase();
+                    if (text.includes('continue with email') || text === 'continue') {
+                        btn.scrollIntoView({ behavior: 'instant', block: 'center' });
                         btn.click();
                         return {found: true, text: btn.textContent.trim()};
                     }
@@ -661,12 +664,25 @@ def main():
                 return {found: false};
             }""")
             clicked = result.get("found", False)
+            if clicked:
+                print(f"✅ 通过JS点击成功: {result.get('text')}")
 
         if not clicked:
             print("❌ 继续按钮缺失")
             page.screenshot(path="kerit_no_continue_btn.png")
             send_wechat("❌ 继续按钮缺失")
             return
+
+        print("⏳ 等待页面跳转/OTP框出现...")
+        # 等待网络请求完成，页面可能正在跳转
+        try:
+            page.wait_for_load_state('networkidle', timeout=15000)
+        except Exception:
+            pass
+        time.sleep(2)
+
+        # 截图查看当前状态
+        page.screenshot(path="kerit_after_click.png")
 
         print("📨 等待OTP框...")
         try:
