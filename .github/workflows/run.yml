@@ -80,7 +80,7 @@ jobs:
 
         # 5. 执行核心自动化登录脚本
         echo "🚀 开始运行 CloakBrowser 自动化脚本..."
-        python cloak_discord.py || touch .script_failed
+        python auto-renew.py || touch .script_failed
 
         # 6. 优雅停止录像
         echo "🛑 脚本运行完毕，正在保存录像..."
