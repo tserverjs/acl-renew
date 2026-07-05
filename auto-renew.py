@@ -1,34 +1,37 @@
 import os
+import sys
 import time
-import re
 import imaplib
 import email
+import re
 import subprocess
+import json
 import urllib.request
 import urllib.parse
-from playwright.sync_api import sync_playwright
+from cloakbrowser import launch_persistent_context
 
 # ============================================================
 # 配置（从环境变量读取）
 # ============================================================
 
-_account = os.environ.get("KERIT_ACCOUNT", "").split(",")
-if len(_account) >= 2:
-    KERIT_EMAIL    = _account[0].strip()
-    GMAIL_PASSWORD = _account[1].strip()
-else:
-    KERIT_EMAIL    = ""
-    GMAIL_PASSWORD = ""
+LOCAL_SOCKS5 = "socks5://127.0.0.1:40000"
+PROFILE_DIR = "./cloak-profile"
 
-MASKED_EMAIL   = "******@" + KERIT_EMAIL.split("@")[1] if "@" in KERIT_EMAIL else "******"
+_account = os.environ["KERIT_ACCOUNT"].split(",")
+KERIT_EMAIL    = _account[0].strip()
+GMAIL_PASSWORD = _account[1].strip()
+
+MASKED_EMAIL   = "******@" + KERIT_EMAIL.split("@")[1]
 
 LOGIN_URL      = "https://billing.kerit.cloud/"
 FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 
-WECHAT_KEY = os.environ.get("WECHAT_KEY", "")
+# 企业微信机器人配置
+WECHAT_WEBHOOK = os.environ.get("WECHAT_WEBHOOK_KEY", "")
+
 
 # ============================================================
-# 微信推送
+# 企业微信机器人推送
 # ============================================================
 
 def now_str():
@@ -36,41 +39,48 @@ def now_str():
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 def send_wechat(result, server_id=None, remaining=None):
+    if not WECHAT_WEBHOOK:
+        print("⚠️ 企业微信未配置，跳过推送")
+        return
+
+    # 构建纯文本消息
     lines = [
-        f"🎮 Kerit 服务器续期通知",
-        f"🕐 运行时间: {now_str()}",
+        "【Kerit 服务器续期通知】",
+        f"运行时间: {now_str()}",
     ]
     if server_id is not None:
-        lines.append(f"🖥 服务器ID: {server_id}")
-    lines.append(f"📊 续期结果: {result}")
+        lines.append(f"服务器ID: {server_id}")
+
+    lines.append(f"续期结果: {result}")
     if remaining is not None:
-        lines.append(f"⏱️ 剩余天数: {remaining}天")
-    msg = "\n".join(lines)
-    
-    if not WECHAT_KEY:
-        print("⚠️ WECHAT_KEY未配置，跳过推送")
-        return
-        
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_KEY}"
-    data = {
+        lines.append(f"剩余天数: {remaining}天")
+
+    msg = chr(10).join(lines)
+
+    payload = {
         "msgtype": "text",
         "text": {
             "content": msg
         }
     }
     
-    import json
     try:
+        data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         req = urllib.request.Request(
-            url, 
-            data=json.dumps(data).encode('utf-8'), 
-            headers={'Content-Type': 'application/json'},
+            WECHAT_WEBHOOK,
+            data=data,
+            headers={'Content-Type': 'application/json; charset=utf-8'},
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            print(f"📨 微信推送成功")
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            if resp_data.get("errcode") == 0:
+                print("📨 企业微信推送成功")
+            else:
+                print(f"⚠️ 企业微信推送失败: {resp_data}")
     except Exception as e:
-        print(f"⚠️ 微信推送失败：{e}")
+        print(f"⚠️ 企业微信推送失败：{e}")
+
 
 # ============================================================
 # IMAP 读取 Gmail OTP
@@ -99,6 +109,8 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
     folders_to_check = ["INBOX"]
     if spam_folder:
         folders_to_check.append(spam_folder)
+    else:
+        print("⚠️ 未找到垃圾邮箱")
 
     seen_uids = {}
     for folder in folders_to_check:
@@ -159,32 +171,239 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
     mail.logout()
     raise TimeoutError("❌ Gmail超时")
 
+
 # ============================================================
-# 辅助解析函数
+# Turnstile 工具函数 (适配 CloakBrowser/Playwright API)
 # ============================================================
 
-def extract_remaining_days(page) -> int:
+EXPAND_POPUP_JS = """
+(function() {
+    var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!turnstileInput) return;
+    var el = turnstileInput;
+    for (var i = 0; i < 20; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var style = window.getComputedStyle(el);
+        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
+            el.style.overflow = 'visible';
+        }
+        el.style.minWidth = 'max-content';
+    }
+    var iframes = document.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+        if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+            iframe.style.width = '300px';
+            iframe.style.height = '65px';
+            iframe.style.minWidth = '300px';
+            iframe.style.visibility = 'visible';
+            iframe.style.opacity = '1';
+        }
+    });
+})();
+"""
+
+def xdotool_click(x, y):
+    x, y = int(x), int(y)
     try:
-        return page.evaluate("""
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        wids = [w for w in result.stdout.strip().split('\n') if w]
+        if wids:
+            subprocess.run(["xdotool", "windowactivate", wids[-1]],
+                           timeout=2, stderr=subprocess.DEVNULL)
+            time.sleep(0.2)
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, check=True)
+        time.sleep(0.15)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, check=True)
+        print(f"📐 坐标点击成功")
+        return True
+    except Exception as e:
+        print(f"⚠️ xdotool点击失败：{e}")
+        return False
+
+
+def get_turnstile_coords(page):
+    try:
+        return page.evaluate("""() => {
+            (function(){
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    var src = iframes[i].src || '';
+                    if (src.includes('cloudflare') || src.includes('turnstile')) {
+                        var rect = iframes[i].getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2)
+                            };
+                        }
+                    }
+                }
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) {
+                    var container = input.parentElement;
+                    for (var j = 0; j < 5; j++) {
+                        if (!container) break;
+                        var rect = container.getBoundingClientRect();
+                        if (rect.width > 100 && rect.height > 30) {
+                            return {
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2)
+                            };
+                        }
+                        container = container.parentElement;
+                    }
+                }
+                return null;
+            })()
+        }""")
+    except Exception:
+        return None
+
+
+def get_window_offset(page):
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        wids = [w for w in result.stdout.strip().split('\n') if w]
+        if wids:
+            geo = subprocess.run(
+                ["xdotool", "getwindowgeometry", "--shell", wids[-1]],
+                capture_output=True, text=True, timeout=3
+            ).stdout
+            geo_dict = {}
+            for line in geo.strip().split('\n'):
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    geo_dict[k.strip()] = int(v.strip())
+            win_x = geo_dict.get('X', 0)
+            win_y = geo_dict.get('Y', 0)
+            info = page.evaluate("""() => {
+                (function(){ return { outer: window.outerHeight, inner: window.innerHeight }; })()
+            }""")
+            toolbar = info['outer'] - info['inner']
+            if not (30 <= toolbar <= 200):
+                toolbar = 87
+            return win_x, win_y, toolbar
+    except Exception:
+        pass
+    try:
+        info = page.evaluate("""() => {
+            (function(){
+                return {
+                    screenX: window.screenX || 0,
+                    screenY: window.screenY || 0,
+                    outer: window.outerHeight,
+                    inner: window.innerHeight
+                };
+            })()
+        }""")
+        toolbar = info['outer'] - info['inner']
+        if not (30 <= toolbar <= 200):
+            toolbar = 87
+        return info['screenX'], info['screenY'], toolbar
+    except Exception:
+        return 0, 0, 87
+
+
+def check_token(page) -> bool:
+    try:
+        return page.evaluate("""() => {
+            (function(){
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return input && input.value && input.value.length > 20;
+            })()
+        }""")
+    except Exception:
+        return False
+
+
+def get_token_value(page) -> str:
+    try:
+        token = page.evaluate("""() => {
+            (function(){
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return (input && input.value) ? input.value : '';
+            })()
+        }""")
+        if token and len(token) > 20:
+            return token
+    except Exception:
+        pass
+    return ''
+
+
+def turnstile_exists(page) -> bool:
+    try:
+        return page.evaluate("""() => {
+            (function(){ return document.querySelector('input[name="cf-turnstile-response"]') !== null; })()
+        }""")
+    except Exception:
+        return False
+
+
+def solve_turnstile(page) -> bool:
+    for _ in range(3):
+        page.evaluate(EXPAND_POPUP_JS)
+        time.sleep(0.5)
+
+    if check_token(page):
+        print("✅ Token已存在")
+        return True
+
+    coords = get_turnstile_coords(page)
+    if not coords:
+        print("❌ 无法获取坐标")
+        return False
+
+    win_x, win_y, toolbar = get_window_offset(page)
+    abs_x = coords['click_x'] + win_x
+    abs_y = coords['click_y'] + win_y + toolbar
+    print(f"🖱️ 点击Token: ({abs_x}, {abs_y})")
+    xdotool_click(abs_x, abs_y)
+
+    for _ in range(30):
+        time.sleep(0.5)
+        if check_token(page):
+            print("✅ Cloudflare Token通过")
+            return True
+
+    print("❌ Cloudflare Token超时")
+    page.screenshot(path="turnstile_fail.png")
+    return False
+
+
+def extract_remaining_days(page) -> int:
+    """从 expiry-display 元素读取剩余天数"""
+    try:
+        return page.evaluate("""() => {
             (function(){
                 var el = document.getElementById('expiry-display');
                 return el ? parseInt(el.innerText || "0") : 0;
             })()
-        """) or 0
+        }""") or 0
     except Exception:
         return 0
 
+
 # ============================================================
-# 后续续期流程
+# 续期流程
 # ============================================================
 
 def do_renew(page):
     print("🔄 跳转续期页...")
-    page.goto(FREE_PANEL_URL)
-    page.wait_for_timeout(4000)
+    page.goto(FREE_PANEL_URL, wait_until="domcontentloaded")
+    time.sleep(4)
     page.screenshot(path="free_panel.png")
 
-    server_id = page.evaluate("(function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()")
+    server_id = page.evaluate("""() => {
+        return (function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()
+    }""")
     if not server_id:
         print("❌ serverData.id缺失")
         page.screenshot(path="no_server_id.png")
@@ -192,37 +411,41 @@ def do_renew(page):
         return
     print(f"🆔 服务器ID: {server_id}")
 
-    initial_count = page.evaluate("""
-        (function(){
+    initial_count = page.evaluate("""() => {
+        return (function(){
             var el = document.getElementById('renewal-count');
             return el ? parseInt(el.innerText || "0") : 0;
         })()
-    """)
+    }""")
     initial_remaining = extract_remaining_days(page)
     need = 7 - initial_count
     print(f"📊 当前进度: {initial_count}/7，剩余天数: {initial_remaining}天，本次需续期: {need}次")
 
     if initial_remaining >= 7:
         print("✅ 剩余天数已满7天，无需续期")
+        page.screenshot(path="renew_skip.png")
         send_wechat("✅ 无需续期（剩余天数已满）", server_id, initial_remaining)
         return
 
     if need <= 0:
         print("🎉 已达上限7/7，无需续期")
-        send_wechat("✅ 无需续期（已达上限 7/7）", server_id, initial_remaining)
+        page.screenshot(path="renew_full.png")
+        remaining = extract_remaining_days(page)
+        send_wechat("✅ 无需续期（已达上限 7/7）", server_id, remaining)
         return
 
     for attempt in range(need):
-        count = page.evaluate("""
-            (function(){
+        count = page.evaluate("""() => {
+            return (function(){
                 var el = document.getElementById('renewal-count');
                 return el ? parseInt(el.innerText || "0") : 0;
             })()
-        """)
+        }""")
         print(f"📊 续期进度: {count}/7")
 
         if count >= 7:
             print("🎉 已达上限7/7，提前结束")
+            page.screenshot(path="renew_full.png")
             remaining = extract_remaining_days(page)
             send_wechat("✅ 续期完成", server_id, remaining)
             return
@@ -230,34 +453,57 @@ def do_renew(page):
         print(f"🔁 第{attempt + 1}/{need}次续期...")
 
         # 点击 Renew Server 按钮
-        try:
-            page.locator('button:has-text("Renew Server"), a:has-text("Renew Server")').first.click(timeout=10000)
-            print("✅ 已点击「Renew Server」")
-        except Exception:
+        renew_clicked = False
+        for _ in range(10):
+            try:
+                buttons = page.locator('a, button').all()
+                for btn in buttons:
+                    text = btn.text_content() or ""
+                    if "Renew Server" in text:
+                        btn.click()
+                        renew_clicked = True
+                        print("✅ 已点击「Renew Server」")
+                        break
+                if renew_clicked:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not renew_clicked:
             print("❌ 续期按钮缺失")
             page.screenshot(path="no_renew_btn.png")
             send_wechat(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id)
             return
 
-        page.wait_for_timeout(2000)
+        time.sleep(2)
 
-        # 续期内部如果有 Turnstile 拦截，在此通过 API 异步提交
-        print("🎯 获取Token并提交续期...")
-        # 等待网页内 Turnstile 渲染出 response（CloakBrowser 通常会自动过）
-        token = ""
+        print("⏳ 等待Turnstile...")
         for _ in range(20):
-            token = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]')?.value || ''")
-            if len(token) > 20:
+            if turnstile_exists(page):
+                print("🛡️ 检测到Turnstile")
                 break
-            page.wait_for_timeout(1000)
-            
+            time.sleep(1)
+        else:
+            print("❌ Turnstile未出现")
+            page.screenshot(path=f"no_turnstile_{attempt}.png")
+            send_wechat(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id)
+            return
+
+        if not solve_turnstile(page):
+            page.screenshot(path=f"turnstile_fail_{attempt}.png")
+            send_wechat(f"❌ Turnstile验证失败，第{attempt + 1}次", server_id)
+            return
+
+        token = get_token_value(page)
         if not token:
-            print("❌ 续期页面 Turnstile Token 获取失败")
+            print("❌ Token获取失败")
             send_wechat(f"❌ Token获取失败，第{attempt + 1}次", server_id)
             return
 
-        result = page.evaluate(f"""
-            (async function() {{
+        print("🎯 提交续期...")
+        result = page.evaluate(f"""() => {{
+            return (async function() {{
                 const res = await fetch('/api/renew', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
@@ -267,42 +513,82 @@ def do_renew(page):
                 const data = await res.json();
                 return JSON.stringify(data);
             }})()
-        """)
-        print(f"🎯 接口返回结果: {result}")
+        }}""")
+        try:
+            res_obj = json.loads(result)
+            if res_obj.get('success') or res_obj == {}:
+                print("✅ 续期成功")
+            else:
+                print(f"❌ 续期失败: {result}")
+        except Exception:
+            print(f"✅ 续期成功")
 
         try:
-            page.evaluate("document.querySelector('[data-bs-dismiss=\"modal\"]')?.click();")
+            page.evaluate("""() => {
+                document.querySelector('[data-bs-dismiss="modal"]')?.click();
+            }""")
         except Exception:
             pass
 
-        page.wait_for_timeout(3000)
-        page.reload()
-        page.wait_for_timeout(3000)
+        time.sleep(3)
+        page.reload(wait_until="domcontentloaded")
+        time.sleep(3)
 
     page.screenshot(path="renew_done.png")
-    final_count = page.evaluate("(function(){ var el = document.getElementById('renewal-count'); return el ? parseInt(el.innerText || '0') : 0; })()")
+    final_count = page.evaluate("""() => {
+        return (function(){
+            var el = document.getElementById('renewal-count');
+            return el ? parseInt(el.innerText || "0") : 0;
+        })()
+    }""")
     final_remaining = extract_remaining_days(page)
     print(f"📊 最终进度: {final_count}/7")
-    send_wechat(f"✅ 续期运行完毕（当前进度 {final_count}/7）", server_id, final_remaining)
+    if final_count >= 7:
+        print("🎉 已达上限7/7")
+        send_wechat("✅ 续期完成", server_id, final_remaining)
+    else:
+        print(f"⚠️ 续期未达上限，当前{final_count}/7")
+        send_wechat(f"⚠️ 续期未达上限（{final_count}/7）", server_id, final_remaining)
+
 
 # ============================================================
-# 主流程
+# 主流程：邮箱OTP登录 + 续期
 # ============================================================
 
 def main():
-    print("🚀 启动 CloakBrowser + Kerit 邮箱OTP自动登录续期")
-    print("============================================================")
-    
-    with sync_playwright() as p:
-        # 连接到已启动的 CloakBrowser 独立浏览器实例
-        browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-        context = browser.contexts[0]
-        page = context.pages[0] if context.pages else context.new_page()
+    if not KERIT_EMAIL or not GMAIL_PASSWORD:
+        print("❌ 错误: 未配置 KERIT_ACCOUNT 环境变量！格式: email,password")
+        sys.exit(1)
 
+    print("=" * 60)
+    print("🚀 启动 CloakBrowser + Kerit 邮箱OTP自动登录续期")
+    print("=" * 60)
+    
+    os.environ["CLOAKBROWSER_SUPPRESS_FONT_WARNING"] = "1"
+    
+    context = launch_persistent_context(
+        PROFILE_DIR,
+        headless=False,
+        humanize=True,
+        human_preset="careful",
+        proxy={"server": LOCAL_SOCKS5},
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+        timezone_id="America/New_York",
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    
+    page = context.new_page()
+
+    try:
         # ── IP 验证 ──────────────────────────────────────────
         print("🌐 验证出口IP...")
         try:
-            page.goto("https://api.ipify.org/?format=json", timeout=15000)
+            page.goto("https://api.ipify.org/?format=json", wait_until="domcontentloaded")
             ip_text = page.locator('body').text_content()
             ip_text = re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'\1xx', ip_text)
             print(f"✅ 出口IP确认：{ip_text}")
@@ -311,19 +597,22 @@ def main():
 
         # ── 登录 ─────────────────────────────────────────────
         print("🔑 打开登录页面...")
-        page.goto(LOGIN_URL)
-        page.wait_for_timeout(3000)
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        time.sleep(3)
 
         print("🛡️ 检查Cloudflare...")
-        # CloakBrowser 会自动处理滑块或挑战，这里做探测等待
-        for _ in range(15):
-            is_cf = page.evaluate("document.querySelector('input[name=\"cf-turnstile-response\"]') !== null")
-            if is_cf:
-                print("🛡️ 检测到Turnstile挑战框，等待CloakBrowser自动通过...")
-                page.wait_for_timeout(2000)
-            else:
+        for _ in range(20):
+            time.sleep(0.5)
+            if turnstile_exists(page):
+                print("🛡️ 检测到Turnstile...")
+                if not solve_turnstile(page):
+                    page.screenshot(path="kerit_cf_fail.png")
+                    send_wechat("❌ 登录页Turnstile验证失败")
+                    return
+                time.sleep(2)
                 break
-        print("✅ 无Turnstile，继续")
+        else:
+            print("✅ 无Turnstile，继续")
 
         print("📭 等待邮箱框...")
         try:
@@ -334,50 +623,75 @@ def main():
             send_wechat("❌ 邮箱框加载失败")
             return
 
-        page.fill('#email-input', KERIT_EMAIL)
+        page.locator('#email-input').fill(KERIT_EMAIL)
         print(f"✅ 邮箱：{MASKED_EMAIL}")
 
         print("🖱️ 点击继续...")
         clicked = False
-        for selector in ['button:has-text("Continue with Email")', 'button[type="submit"]', 'form button']:
+
+        # 先等待按钮可点击
+        page.wait_for_load_state('networkidle', timeout=15000)
+        time.sleep(1)
+
+        for selector in [
+            'button:has-text("Continue with Email")',
+            'a:has-text("Continue with Email")',
+            'button[type="submit"]',
+        ]:
             try:
-                if page.locator(selector).is_visible():
-                    page.locator(selector).click(timeout=5000)
+                if page.locator(selector).count() > 0:
+                    page.locator(selector).first.click(timeout=10000)
                     clicked = True
-                    print(f"✅ 通过选择器强行点击成功: {selector}")
+                    print(f"✅ 通过选择器点击成功: {selector}")
                     break
-            except Exception:
+            except Exception as e:
+                print(f"  选择器 {selector} 失败: {e}")
                 continue
 
         if not clicked:
-            print("❌ 继续按钮缺失或点击失败")
+            # 使用 JavaScript 点击
+            result = page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const btn of buttons) {
+                    const text = btn.textContent.trim().toLowerCase();
+                    if (text.includes('continue with email') || text === 'continue') {
+                        btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        btn.click();
+                        return {found: true, text: btn.textContent.trim()};
+                    }
+                }
+                return {found: false};
+            }""")
+            clicked = result.get("found", False)
+            if clicked:
+                print(f"✅ 通过JS点击成功: {result.get('text')}")
+
+        if not clicked:
+            print("❌ 继续按钮缺失")
             page.screenshot(path="kerit_no_continue_btn.png")
             send_wechat("❌ 继续按钮缺失")
             return
 
         print("⏳ 等待页面跳转/OTP框出现...")
-        page.wait_for_timeout(4000)  # 稳固停留，等待目标 DOM 树重新分发
+        # 等待网络请求完成，页面可能正在跳转
+        try:
+            page.wait_for_load_state('networkidle', timeout=15000)
+        except Exception:
+            pass
+        time.sleep(2)
+
+        # 截图查看当前状态
+        page.screenshot(path="kerit_after_click.png")
 
         print("📨 等待OTP框...")
-        # 兼容性多特征组合探测器，避开脆弱的纯 Class 定位
-        otp_selector = 'input[class*="otp"], input[id*="otp"], input[maxlength="1"], input[type="text"]'
         try:
-            page.wait_for_selector(otp_selector, state='visible', timeout=25000)
-            print("✅ 成功发现并锁定验证码输入区")
+            page.wait_for_selector('.otp-input', state='visible', timeout=30000)
         except Exception:
-            # 保底方案：即使输入框被魔改没有属性，只要页面还有任何 input 就强行推进
-            try:
-                if page.locator('input').first.is_visible():
-                    print("⚠️ 未发现标准特征的 OTP 输入框，锁定普通 Input 输入框作为备用")
-                else:
-                    raise Exception()
-            except Exception:
-                print("❌ OTP框加载失败")
-                page.screenshot(path="kerit_no_otp.png")
-                send_wechat("❌ OTP框加载失败")
-                return
+            print("❌ OTP框加载失败")
+            page.screenshot(path="kerit_no_otp.png")
+            send_wechat("❌ OTP框加载失败")
+            return
 
-        # 获取邮件 OTP 码
         try:
             code = fetch_otp_from_gmail(wait_seconds=60)
         except TimeoutError as e:
@@ -386,56 +700,60 @@ def main():
             send_wechat("❌ Gmail OTP获取超时")
             return
 
-        print(f"⌨️ 填入OTP: {code}")
-        
-        # 核心修复：强力免依赖 JS 序列填入法
-        # 获取全部可见框，不论类名是否变动，按物理序列强制注入
-        js_fill_otp = f"""
-            (function() {{
-                var inputs = Array.from(document.querySelectorAll('input')).filter(el => {{
-                    var style = window.getComputedStyle(el);
-                    return style.display !== 'none' && style.visibility !== 'hidden' && el.type !== 'hidden';
-                }});
-                
-                if (inputs.length < 4) {{
-                    inputs = Array.from(document.querySelectorAll('input'));
-                }}
+        otp_inputs = page.locator('.otp-input').all()
+        if len(otp_inputs) < 4:
+            print(f"❌ OTP框不足: {len(otp_inputs)}")
+            send_wechat(f"❌ OTP框数量不足（{len(otp_inputs)}）")
+            return
 
-                var codeStr = '{code}';
-                for (var i = 0; i < Math.min(codeStr.length, inputs.length); i++) {{
-                    var inp = inputs[i];
-                    var char = codeStr[i];
-                    
-                    inp.focus();
+        print(f"⌨️ 填入OTP: {code}")
+        for i, char in enumerate(code):
+            js = f"""
+                (function() {{
+                    var inputs = document.querySelectorAll('.otp-input');
+                    var inp = inputs[{i}];
+                    if (!inp) return;
                     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value').set;
-                    nativeInputValueSetter.call(inp, char);
-                    
+                    nativeInputValueSetter.call(inp, '{char}');
                     inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    inp.dispatchEvent(new KeyboardEvent('keydown', {{ key: char, bubbles: true }}));
-                    inp.dispatchEvent(new KeyboardEvent('keyup', {{ key: char, bubbles: true }}));
-                }}
-            }})();
-        """
-        try:
-            page.evaluate(js_fill_otp)
-            print("✅ OTP已填入")
-        except Exception as e:
-            print(f"⚠️ JS 填写验证码异常: {e}")
-            
-        page.wait_for_timeout(500)
+                }})();
+            """
+            page.evaluate(js)
+            time.sleep(0.1)
+
+        print("✅ OTP已填入")
+        time.sleep(0.5)
 
         print("🚀 点击验证...")
         verify_clicked = False
-        for selector in ['button:has-text("Verify Code")', 'button[type="submit"]', 'form button.btn-primary']:
+        for selector in [
+            'button:has-text("Verify Code")',
+            'a:has-text("Verify Code")',
+            'button[type="submit"]',
+        ]:
             try:
-                if page.locator(selector).is_visible():
-                    page.locator(selector).click(timeout=5000)
+                if page.locator(selector).count() > 0:
+                    page.click(selector, timeout=10000)
                     verify_clicked = True
                     break
             except Exception:
                 continue
+
+        if not verify_clicked:
+            result = page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const btn of buttons) {
+                    if (btn.textContent.toLowerCase().includes('verify') || 
+                        btn.textContent.toLowerCase().includes('verify code')) {
+                        btn.click();
+                        return {found: true, text: btn.textContent.trim()};
+                    }
+                }
+                return {found: false};
+            }""")
+            verify_clicked = result.get("found", False)
 
         if not verify_clicked:
             print("❌ 验证按钮缺失")
@@ -444,19 +762,41 @@ def main():
             return
 
         print("⏳ 等待登录跳转...")
-        for _ in range(60):
-            if "/session" in page.url or "/free_panel" in page.url:
-                print("✅ 登录成功！")
-                break
-            page.wait_for_timeout(500)
+        for _ in range(80):
+            try:
+                url = page.url
+                if "/session" in url:
+                    print("✅ 登录成功！")
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
         else:
             print("❌ 登录等待超时")
             page.screenshot(path="kerit_login_timeout.png")
             send_wechat("❌ 登录等待超时")
             return
 
-        # 执行续期循环
+        # ── 执行续期 ─────────────────────────────────────────
         do_renew(page)
+
+        # 保存会话
+        context.storage_state(path="kerit_auth.json")
+        print("\n" + "=" * 60)
+        print("🎉 任务完成！会话已保存至 kerit_auth.json")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\n❌ 自动化链条断裂: {str(e)}")
+        try:
+            page.screenshot(path="error_screenshot.png")
+            print("📸 错误截图已保存: error_screenshot.png")
+        except:
+            pass
+        sys.exit(1)
+    finally:
+        context.close()
+
 
 if __name__ == "__main__":
     main()
