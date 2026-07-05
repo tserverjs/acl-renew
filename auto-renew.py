@@ -1,152 +1,576 @@
 import os
 import sys
 import time
+import imaplib
+import email
+import re
+import subprocess
+import json
+import urllib.request
 from cloakbrowser import launch_persistent_context
 
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+# ============================================================
+# 配置（从环境变量读取）
+# ============================================================
+
 LOCAL_SOCKS5 = "socks5://127.0.0.1:40000"
 PROFILE_DIR = "./cloak-profile"
 
+_account = os.environ["KERIT_ACCOUNT"].split(",")
+KERIT_EMAIL    = _account[0].strip()
+GMAIL_PASSWORD = _account[1].strip()
 
-def inject_discord_token(page, token):
-    """
-    全面注入 Discord Token 到所有可能的位置。
-    Discord 2024+ 的安全策略要求多位置注入。
-    """
-    # 清理 Token（去掉两端引号）
-    clean_token = token.strip().strip('"').strip("'")
-    
-    if len(clean_token) < 50:
-        print("  ⚠️ Token 长度异常，可能无效！")
-    
-    print(f"  🔑 注入 Token (前15位): {clean_token[:15]}...")
-    
-    result = page.evaluate("""(token) => {
-        const t = token;
-        const results = [];
-        
-        // 1. localStorage - 标准位置
-        try { 
-            localStorage.setItem("token", '"' + t + '"'); 
-            results.push("localStorage: OK");
-        } catch(e) { results.push("localStorage: FAIL - " + e.message); }
-        
-        // 2. sessionStorage
-        try { 
-            sessionStorage.setItem("token", '"' + t + '"'); 
-            results.push("sessionStorage: OK");
-        } catch(e) { results.push("sessionStorage: FAIL - " + e.message); }
-        
-        // 3. Cookie（多域名覆盖）
-        try { 
-            document.cookie = "token=" + encodeURIComponent('"' + t + '"') + "; path=/; domain=.discord.com";
-            document.cookie = "token=" + encodeURIComponent('"' + t + '"') + "; path=/; domain=discord.com";
-            results.push("Cookie: OK");
-        } catch(e) { results.push("Cookie: FAIL - " + e.message); }
-        
-        // 4. 覆盖 Discord 内部 webpack 模块的 getToken
-        try {
-            if (window.webpackChunkdiscord_app) {
-                window.webpackChunkdiscord_app.push([
-                    [Math.random()], {}, 
-                    req => {
-                        for (const m of Object.keys(req.c || {})) {
-                            const mod = req.c[m].exports;
-                            if (mod && mod.default && typeof mod.default.getToken === 'function') {
-                                mod.default.getToken = () => t;
-                            }
-                            if (mod && typeof mod.getToken === 'function') {
-                                mod.getToken = () => t;
-                            }
+MASKED_EMAIL   = "******@" + KERIT_EMAIL.split("@")[1]
+
+LOGIN_URL      = "https://billing.kerit.cloud/"
+FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
+
+# 企业微信机器人配置
+WECHAT_WEBHOOK_KEY = os.environ.get("WECHAT_WEBHOOK_KEY", "")
+WECHAT_WEBHOOK_URL = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_WEBHOOK_KEY}" if WECHAT_WEBHOOK_KEY else ""
+
+
+# ============================================================
+# 企业微信机器人推送
+# ============================================================
+
+def now_str():
+    import datetime
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+def send_wechat(result, server_id=None, remaining=None):
+    if not WECHAT_WEBHOOK_KEY:
+        print("⚠️ 企业微信未配置，跳过推送")
+        return
+
+    content_lines = [
+        f"🎮 Kerit 服务器续期通知",
+        f"🕐 运行时间: {now_str()}",
+    ]
+    if server_id is not None:
+        content_lines.append(f"🖥 服务器ID: {server_id}")
+
+    content_lines.append(f"📊 续期结果: {result}")
+    if remaining is not None:
+        content_lines.append(f"⏱️ 剩余天数: {remaining}天")
+
+    content_text = "\n".join(content_lines)
+
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": content_text
+        }
+    }
+
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        req = urllib.request.Request(
+            WECHAT_WEBHOOK_URL,
+            data=data,
+            headers={'Content-Type': 'application/json; charset=utf-8'},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            if resp_data.get("errcode") == 0:
+                print("📨 企业微信推送成功")
+            else:
+                print(f"⚠️ 企业微信推送失败: {resp_data}")
+    except Exception as e:
+        print(f"⚠️ 企业微信推送失败：{e}")
+
+
+# ============================================================
+# IMAP 读取 Gmail OTP
+# ============================================================
+
+def fetch_otp_from_gmail(wait_seconds=60) -> str:
+    print(f"📬 连接Gmail，等待{wait_seconds}s...")
+    deadline = time.time() + wait_seconds
+
+    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    mail.login(KERIT_EMAIL, GMAIL_PASSWORD)
+
+    spam_folder = None
+    _, folder_list = mail.list()
+    for f in folder_list:
+        decoded = f.decode("utf-8", errors="ignore")
+        if any(k in decoded for k in ["Spam", "Junk", "垃圾", "spam", "junk"]):
+            match = re.search(r'"([^"]+)"\s*$', decoded)
+            if not match:
+                match = re.search(r'(\S+)\s*$', decoded)
+            if match:
+                spam_folder = match.group(1).strip('"')
+                print(f"🗑️ 检查Gmail垃圾邮箱")
+                break
+
+    folders_to_check = ["INBOX"]
+    if spam_folder:
+        folders_to_check.append(spam_folder)
+    else:
+        print("⚠️ 未找到垃圾邮箱")
+
+    seen_uids = {}
+    for folder in folders_to_check:
+        try:
+            status, _ = mail.select(folder)
+            if status != "OK":
+                raise Exception(f"select失败: {status}")
+            _, data = mail.uid("search", None, "ALL")
+            seen_uids[folder] = set(data[0].split())
+        except Exception as e:
+            print(f"⚠️ 文件夹异常 {folder}: {e}")
+            seen_uids[folder] = set()
+
+    while time.time() < deadline:
+        time.sleep(5)
+
+        for folder in folders_to_check:
+            try:
+                status, _ = mail.select(folder)
+                if status != "OK":
+                    continue
+                _, data = mail.uid("search", None, 'FROM "kerit"')
+                all_uids = set(data[0].split())
+                new_uids = all_uids - seen_uids[folder]
+
+                for uid in new_uids:
+                    seen_uids[folder].add(uid)
+                    _, msg_data = mail.uid("fetch", uid, "(RFC822)")
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == "text/plain":
+                                body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                break
+                        if not body:
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/html":
+                                    html = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                    body = re.sub(r'<[^>]+>', ' ', html)
+                                    break
+                    else:
+                        body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+
+                    otp = re.search(r'(\d{4})', body)
+                    if otp:
+                        code = otp.group(1)
+                        print(f"✅ Gmail OTP: {code}")
+                        mail.logout()
+                        return code
+
+            except Exception as e:
+                print(f"⚠️ 检查{folder}出错: {e}")
+                continue
+
+    mail.logout()
+    raise TimeoutError("❌ Gmail超时")
+
+
+# ============================================================
+# Turnstile 工具函数 (适配 CloakBrowser/Playwright API)
+# ============================================================
+
+EXPAND_POPUP_JS = """
+(function() {
+    var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!turnstileInput) return;
+    var el = turnstileInput;
+    for (var i = 0; i < 20; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var style = window.getComputedStyle(el);
+        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
+            el.style.overflow = 'visible';
+        }
+        el.style.minWidth = 'max-content';
+    }
+    var iframes = document.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+        if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+            iframe.style.width = '300px';
+            iframe.style.height = '65px';
+            iframe.style.minWidth = '300px';
+            iframe.style.visibility = 'visible';
+            iframe.style.opacity = '1';
+        }
+    });
+})();
+"""
+
+def xdotool_click(x, y):
+    x, y = int(x), int(y)
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        wids = [w for w in result.stdout.strip().split('\n') if w]
+        if wids:
+            subprocess.run(["xdotool", "windowactivate", wids[-1]],
+                           timeout=2, stderr=subprocess.DEVNULL)
+            time.sleep(0.2)
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, check=True)
+        time.sleep(0.15)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, check=True)
+        print(f"📐 坐标点击成功")
+        return True
+    except Exception as e:
+        print(f"⚠️ xdotool点击失败：{e}")
+        return False
+
+
+def get_turnstile_coords(page):
+    try:
+        return page.evaluate("""() => {
+            (function(){
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    var src = iframes[i].src || '';
+                    if (src.includes('cloudflare') || src.includes('turnstile')) {
+                        var rect = iframes[i].getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2)
+                            };
                         }
                     }
-                ]);
-                results.push("webpack: OK");
-            } else {
-                results.push("webpack: SKIP (not loaded)");
-            }
-        } catch(e) { results.push("webpack: FAIL - " + e.message); }
-        
-        // 5. 直接设置 window 对象
-        try { 
-            window.token = t; 
-            window.__DISCORD_TOKEN__ = t;
-            results.push("window: OK");
-        } catch(e) { results.push("window: FAIL - " + e.message); }
-        
-        // 6. 尝试设置 document.defaultView
-        try {
-            if (document.defaultView) {
-                document.defaultView.localStorage.setItem("token", '"' + t + '"');
-                results.push("defaultView: OK");
-            }
-        } catch(e) { results.push("defaultView: FAIL - " + e.message); }
-        
-        return results;
-    }""", clean_token)
-    
-    for r in result:
-        print(f"    {r}")
-    print("  ✅ Token 注入完成")
+                }
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) {
+                    var container = input.parentElement;
+                    for (var j = 0; j < 5; j++) {
+                        if (!container) break;
+                        var rect = container.getBoundingClientRect();
+                        if (rect.width > 100 && rect.height > 30) {
+                            return {
+                                click_x: Math.round(rect.x + 30),
+                                click_y: Math.round(rect.y + rect.height / 2)
+                            };
+                        }
+                        container = container.parentElement;
+                    }
+                }
+                return null;
+            })()
+        }""")
+    except Exception:
+        return None
 
 
-def wait_for_cloudflare(page, timeout=90):
-    """
-    等待 Cloudflare 验证完成。
-    验证通过后页面会在根路径 / 上显示登录界面。
-    """
-    print("⏳ 等待 Cloudflare 验证完成...")
-    start = time.time()
-    
-    while time.time() - start < timeout:
-        url = page.url
-        title = page.title()
-        content = ""
-        try:
-            content = page.content()
-        except:
-            pass
-        
-        # 检查是否还在验证页
-        if any(x in title.lower() for x in ["just a moment", "security verification", "verifying"]):
-            print(f"  🔄 仍在验证页... ({int(time.time()-start)}s)")
-            time.sleep(2)
-            continue
-        
-        # 检查是否已显示登录界面
-        if "billing.kerit.cloud" in url:
-            has_discord = "continue with discord" in content.lower()
-            has_email = "continue with email" in content.lower() or "email address" in content.lower()
-            has_cf_success = "成功" in content or "success" in content.lower()
-            
-            if has_discord or has_email or has_cf_success:
-                print(f"  ✅ 登录界面已加载！")
-                return True
-        
-        time.sleep(2)
-    
-    print(f"  ⚠️ 等待超时，当前 URL: {page.url}")
+def get_window_offset(page):
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        wids = [w for w in result.stdout.strip().split('\n') if w]
+        if wids:
+            geo = subprocess.run(
+                ["xdotool", "getwindowgeometry", "--shell", wids[-1]],
+                capture_output=True, text=True, timeout=3
+            ).stdout
+            geo_dict = {}
+            for line in geo.strip().split('\n'):
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    geo_dict[k.strip()] = int(v.strip())
+            win_x = geo_dict.get('X', 0)
+            win_y = geo_dict.get('Y', 0)
+            info = page.evaluate("""() => {
+                (function(){ return { outer: window.outerHeight, inner: window.innerHeight }; })()
+            }""")
+            toolbar = info['outer'] - info['inner']
+            if not (30 <= toolbar <= 200):
+                toolbar = 87
+            return win_x, win_y, toolbar
+    except Exception:
+        pass
+    try:
+        info = page.evaluate("""() => {
+            (function(){
+                return {
+                    screenX: window.screenX || 0,
+                    screenY: window.screenY || 0,
+                    outer: window.outerHeight,
+                    inner: window.innerHeight
+                };
+            })()
+        }""")
+        toolbar = info['outer'] - info['inner']
+        if not (30 <= toolbar <= 200):
+            toolbar = 87
+        return info['screenX'], info['screenY'], toolbar
+    except Exception:
+        return 0, 0, 87
+
+
+def check_token(page) -> bool:
+    try:
+        return page.evaluate("""() => {
+            (function(){
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return input && input.value && input.value.length > 20;
+            })()
+        }""")
+    except Exception:
+        return False
+
+
+def get_token_value(page) -> str:
+    try:
+        token = page.evaluate("""() => {
+            (function(){
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                return (input && input.value) ? input.value : '';
+            })()
+        }""")
+        if token and len(token) > 20:
+            return token
+    except Exception:
+        pass
+    return ''
+
+
+def turnstile_exists(page) -> bool:
+    try:
+        return page.evaluate("""() => {
+            (function(){ return document.querySelector('input[name="cf-turnstile-response"]') !== null; })()
+        }""")
+    except Exception:
+        return False
+
+
+def solve_turnstile(page) -> bool:
+    for _ in range(3):
+        page.evaluate(EXPAND_POPUP_JS)
+        time.sleep(0.5)
+
+    if check_token(page):
+        print("✅ Token已存在")
+        return True
+
+    coords = get_turnstile_coords(page)
+    if not coords:
+        print("❌ 无法获取坐标")
+        return False
+
+    win_x, win_y, toolbar = get_window_offset(page)
+    abs_x = coords['click_x'] + win_x
+    abs_y = coords['click_y'] + win_y + toolbar
+    print(f"🖱️ 点击Token: ({abs_x}, {abs_y})")
+    xdotool_click(abs_x, abs_y)
+
+    for _ in range(30):
+        time.sleep(0.5)
+        if check_token(page):
+            print("✅ Cloudflare Token通过")
+            return True
+
+    print("❌ Cloudflare Token超时")
+    page.screenshot(path="turnstile_fail.png")
     return False
 
 
+def extract_remaining_days(page) -> int:
+    """从 expiry-display 元素读取剩余天数"""
+    try:
+        return page.evaluate("""() => {
+            (function(){
+                var el = document.getElementById('expiry-display');
+                return el ? parseInt(el.innerText || "0") : 0;
+            })()
+        }""") or 0
+    except Exception:
+        return 0
+
+
+# ============================================================
+# 续期流程
+# ============================================================
+
+def do_renew(page):
+    print("🔄 跳转续期页...")
+    page.goto(FREE_PANEL_URL, wait_until="domcontentloaded")
+    time.sleep(4)
+    page.screenshot(path="free_panel.png")
+
+    server_id = page.evaluate("""() => {
+        return (function(){ return typeof serverData !== 'undefined' ? serverData.id : null; })()
+    }""")
+    if not server_id:
+        print("❌ serverData.id缺失")
+        page.screenshot(path="no_server_id.png")
+        send_wechat("❌ serverData.id缺失，续期失败")
+        return
+    print(f"🆔 服务器ID: {server_id}")
+
+    initial_count = page.evaluate("""() => {
+        return (function(){
+            var el = document.getElementById('renewal-count');
+            return el ? parseInt(el.innerText || "0") : 0;
+        })()
+    }""")
+    initial_remaining = extract_remaining_days(page)
+    need = 7 - initial_count
+    print(f"📊 当前进度: {initial_count}/7，剩余天数: {initial_remaining}天，本次需续期: {need}次")
+
+    if initial_remaining >= 7:
+        print("✅ 剩余天数已满7天，无需续期")
+        page.screenshot(path="renew_skip.png")
+        send_wechat("✅ 无需续期（剩余天数已满）", server_id, initial_remaining)
+        return
+
+    if need <= 0:
+        print("🎉 已达上限7/7，无需续期")
+        page.screenshot(path="renew_full.png")
+        remaining = extract_remaining_days(page)
+        send_wechat("✅ 无需续期（已达上限 7/7）", server_id, remaining)
+        return
+
+    for attempt in range(need):
+        count = page.evaluate("""() => {
+            return (function(){
+                var el = document.getElementById('renewal-count');
+                return el ? parseInt(el.innerText || "0") : 0;
+            })()
+        }""")
+        print(f"📊 续期进度: {count}/7")
+
+        if count >= 7:
+            print("🎉 已达上限7/7，提前结束")
+            page.screenshot(path="renew_full.png")
+            remaining = extract_remaining_days(page)
+            send_wechat("✅ 续期完成", server_id, remaining)
+            return
+
+        print(f"🔁 第{attempt + 1}/{need}次续期...")
+
+        # 点击 Renew Server 按钮
+        renew_clicked = False
+        for _ in range(10):
+            try:
+                buttons = page.locator('a, button').all()
+                for btn in buttons:
+                    text = btn.text_content() or ""
+                    if "Renew Server" in text:
+                        btn.click()
+                        renew_clicked = True
+                        print("✅ 已点击「Renew Server」")
+                        break
+                if renew_clicked:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not renew_clicked:
+            print("❌ 续期按钮缺失")
+            page.screenshot(path="no_renew_btn.png")
+            send_wechat(f"❌ 续期按钮缺失，第{attempt + 1}次失败", server_id)
+            return
+
+        time.sleep(2)
+
+        print("⏳ 等待Turnstile...")
+        for _ in range(20):
+            if turnstile_exists(page):
+                print("🛡️ 检测到Turnstile")
+                break
+            time.sleep(1)
+        else:
+            print("❌ Turnstile未出现")
+            page.screenshot(path=f"no_turnstile_{attempt}.png")
+            send_wechat(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id)
+            return
+
+        if not solve_turnstile(page):
+            page.screenshot(path=f"turnstile_fail_{attempt}.png")
+            send_wechat(f"❌ Turnstile验证失败，第{attempt + 1}次", server_id)
+            return
+
+        token = get_token_value(page)
+        if not token:
+            print("❌ Token获取失败")
+            send_wechat(f"❌ Token获取失败，第{attempt + 1}次", server_id)
+            return
+
+        print("🎯 提交续期...")
+        result = page.evaluate(f"""() => {{
+            return (async function() {{
+                const res = await fetch('/api/renew', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify({{ id: '{server_id}', captcha: '{token}' }})
+                }});
+                const data = await res.json();
+                return JSON.stringify(data);
+            }})()
+        }}""")
+        try:
+            res_obj = json.loads(result)
+            if res_obj.get('success') or res_obj == {{}}:
+                print("✅ 续期成功")
+            else:
+                print(f"❌ 续期失败: {result}")
+        except Exception:
+            print(f"✅ 续期成功")
+
+        try:
+            page.evaluate("""() => {
+                document.querySelector('[data-bs-dismiss="modal"]')?.click();
+            }""")
+        except Exception:
+            pass
+
+        time.sleep(3)
+        page.reload(wait_until="domcontentloaded")
+        time.sleep(3)
+
+    page.screenshot(path="renew_done.png")
+    final_count = page.evaluate("""() => {
+        return (function(){
+            var el = document.getElementById('renewal-count');
+            return el ? parseInt(el.innerText || "0") : 0;
+        })()
+    }""")
+    final_remaining = extract_remaining_days(page)
+    print(f"📊 最终进度: {final_count}/7")
+    if final_count >= 7:
+        print("🎉 已达上限7/7")
+        send_wechat("✅ 续期完成", server_id, final_remaining)
+    else:
+        print(f"⚠️ 续期未达上限，当前{final_count}/7")
+        send_wechat(f"⚠️ 续期未达上限（{final_count}/7）", server_id, final_remaining)
+
+
+# ============================================================
+# 主流程：邮箱OTP登录 + 续期
+# ============================================================
+
 def main():
-    if not DISCORD_TOKEN:
-        print("❌ 错误: 未配置 DISCORD_TOKEN 环境变量！")
+    if not KERIT_EMAIL or not GMAIL_PASSWORD:
+        print("❌ 错误: 未配置 KERIT_ACCOUNT 环境变量！格式: email,password")
         sys.exit(1)
 
     print("=" * 60)
-    print("🚀 启动 CloakBrowser + Kerit 自动登录")
+    print("🚀 启动 CloakBrowser + Kerit 邮箱OTP自动登录续期")
     print("=" * 60)
-    
+
     os.environ["CLOAKBROWSER_SUPPRESS_FONT_WARNING"] = "1"
-    
+
     context = launch_persistent_context(
         PROFILE_DIR,
         headless=False,
         humanize=True,
         human_preset="careful",
         proxy={"server": LOCAL_SOCKS5},
-        # geoip=True,  # 禁用，避免 Failed to discover exit IP 错误
         viewport={"width": 1920, "height": 1080},
         locale="en-US",
         timezone_id="America/New_York",
@@ -156,215 +580,189 @@ def main():
             "--disable-blink-features=AutomationControlled",
         ],
     )
-    
+
     page = context.new_page()
 
     try:
-        # ==================== Step 1: 打开 Kerit 首页 ====================
-        print("\n📌 Step 1: 打开 Kerit 首页...")
-        page.goto("https://billing.kerit.cloud/", wait_until="domcontentloaded")
+        # ── IP 验证 ──────────────────────────────────────────
+        print("🌐 验证出口IP...")
+        try:
+            page.goto("https://api.ipify.org/?format=json", wait_until="domcontentloaded")
+            ip_text = page.locator('body').text_content()
+            ip_text = re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'xx', ip_text)
+            print(f"✅ 出口IP确认：{ip_text}")
+        except Exception:
+            print("⚠️ IP验证超时，跳过")
+
+        # ── 登录 ─────────────────────────────────────────────
+        print("🔑 打开登录页面...")
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
         time.sleep(3)
-        
-        # ==================== Step 2: 等待 Cloudflare 验证 ====================
-        print("\n📌 Step 2: 等待 Cloudflare 验证...")
-        if not wait_for_cloudflare(page, timeout=90):
-            print("⚠️ 验证超时，尝试刷新...")
-            page.reload(wait_until="domcontentloaded")
-            time.sleep(5)
-            if not wait_for_cloudflare(page, timeout=30):
-                print("❌ 无法通过 Cloudflare 验证")
-                sys.exit(1)
-        
-        page.screenshot(path="debug_login_page.png")
-        print("  📸 已保存调试截图: debug_login_page.png")
-        
-        # ==================== Step 3: 点击 Discord 登录 ====================
-        print("\n📌 Step 3: 点击 Discord 登录...")
-        
-        discord_selectors = [
-            'button:has-text("Continue with Discord")',
-            'a:has-text("Continue with Discord")',
-            '[class*="discord" i]',
-            'button:has-text("Discord")',
-            'a:has-text("Discord")',
-        ]
-        
+
+        print("🛡️ 检查Cloudflare...")
+        for _ in range(20):
+            time.sleep(0.5)
+            if turnstile_exists(page):
+                print("🛡️ 检测到Turnstile...")
+                if not solve_turnstile(page):
+                    page.screenshot(path="kerit_cf_fail.png")
+                    send_wechat("❌ 登录页Turnstile验证失败")
+                    return
+                time.sleep(2)
+                break
+        else:
+            print("✅ 无Turnstile，继续")
+
+        print("📭 等待邮箱框...")
+        try:
+            page.wait_for_selector('#email-input', state='visible', timeout=20000)
+        except Exception:
+            print("❌ 邮箱框加载失败")
+            page.screenshot(path="kerit_no_email_input.png")
+            send_wechat("❌ 邮箱框加载失败")
+            return
+
+        page.locator('#email-input').fill(KERIT_EMAIL)
+        print(f"✅ 邮箱：{MASKED_EMAIL}")
+
+        print("🖱️ 点击继续...")
         clicked = False
-        for selector in discord_selectors:
+        for selector in [
+            'button:has-text("Continue with Email")',
+            'a:has-text("Continue with Email")',
+            'button[type="submit"]',
+        ]:
             try:
                 if page.locator(selector).count() > 0:
-                    print(f"  ✅ 找到 Discord 按钮: {selector}")
                     page.click(selector, timeout=10000)
                     clicked = True
                     break
-            except Exception as e:
-                print(f"  ❌ 选择器失败 {selector}: {e}")
-        
+            except Exception:
+                continue
+
         if not clicked:
-            print("  📟 执行 JS 兜底...")
             result = page.evaluate("""() => {
-                const links = Array.from(document.querySelectorAll('a, button'));
-                const discordLink = links.find(el => 
-                    el.textContent.toLowerCase().includes('continue with discord') ||
-                    el.textContent.toLowerCase().includes('discord')
-                );
-                if (discordLink) {
-                    discordLink.click();
-                    return {found: true, text: discordLink.textContent.trim(), tag: discordLink.tagName};
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const btn of buttons) {
+                    if (btn.textContent.toLowerCase().includes('continue with email') || 
+                        btn.textContent.toLowerCase().includes('continue')) {
+                        btn.click();
+                        return {found: true, text: btn.textContent.trim()};
+                    }
                 }
-                return {found: false, html: document.body.innerText.substring(0, 300)};
+                return {found: false};
             }""")
-            print(f"  JS 结果: {result}")
             clicked = result.get("found", False)
-            time.sleep(3)
-        
+
         if not clicked:
-            print("❌ 无法找到 Discord 登录入口！")
-            page.screenshot(path="error_no_discord.png")
-            sys.exit(1)
-        
-        # ==================== Step 4: 等待跳转到 Discord ====================
-        print("\n📌 Step 4: 等待 Discord 页面...")
+            print("❌ 继续按钮缺失")
+            page.screenshot(path="kerit_no_continue_btn.png")
+            send_wechat("❌ 继续按钮缺失")
+            return
+
+        print("📨 等待OTP框...")
         try:
-            page.wait_for_url(lambda url: "discord.com" in url, timeout=40000)
-            print(f"  ✅ 已进入 Discord: {page.url[:80]}...")
-        except Exception as e:
-            print(f"  ❌ 未跳转到 Discord: {e}")
-            print(f"  当前 URL: {page.url}")
-            page.screenshot(path="error_discord_redirect.png")
-            sys.exit(1)
-        
-        time.sleep(3)
-        
-        # ==================== Step 5: 访问 Discord 主站注入 Token ====================
-        print("\n📌 Step 5: 访问 Discord 主站并注入 Token...")
-        
-        # 先访问 Discord app 页面，确保在正确的域下
-        page.goto("https://discord.com/app", wait_until="domcontentloaded")
-        time.sleep(5)
-        
-        # 注入 Token
-        inject_discord_token(page, DISCORD_TOKEN)
-        
-        # 刷新确认登录状态
-        print("  🔄 刷新页面验证登录状态...")
-        page.reload(wait_until="domcontentloaded")
-        time.sleep(8)
-        
-        # 检查是否已登录（URL 应该变成 /channels/@me 或 /app，而不是 /login）
-        current_url = page.url
-        print(f"  当前 URL: {current_url}")
-        
-        if "discord.com/login" in current_url:
-            print("❌ Token 无效或已过期，仍然需要登录！")
-            page.screenshot(path="error_discord_login.png")
-            sys.exit(1)
-        
-        if "/app" in current_url or "/channels" in current_url or "/library" in current_url:
-            print("  ✅ Discord 登录成功！")
-        else:
-            print("  ⚠️ Discord 状态不确定，继续尝试...")
-        
-        # ==================== Step 6: 前往 OAuth2 授权页 ====================
-        print("\n📌 Step 6: 前往 Kerit OAuth2 授权页...")
-        
-        oauth_url = ("https://discord.com/oauth2/authorize"
-                     "?client_id=1432019029245038835"
-                     "&redirect_uri=https%3A%2F%2Fbilling.kerit.cloud%2Fauth%2Fdiscord%2Fcallback"
-                     "&response_type=code"
-                     "&scope=identify+email"
-                     "&prompt=consent"
-                     "&state=login")
-        
-        page.goto(oauth_url, wait_until="domcontentloaded")
-        time.sleep(5)
-        
-        # ==================== Step 7: 处理 OAuth2 授权 ====================
-        print("\n📌 Step 7: 处理 Discord OAuth2 授权...")
-        
-        # 先截图看当前状态
-        page.screenshot(path="debug_oauth2_page.png")
-        print("  📸 已保存 OAuth2 页面截图: debug_oauth2_page.png")
-        
-        # 滚动到底部确保按钮可见
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        
-        # 尝试点击授权按钮（支持多种文本）
-        auth_result = page.evaluate("""() => {
-            const buttons = document.querySelectorAll("button, a[role='button']");
-            const candidates = [];
-            
-            for (const btn of buttons) {
-                const txt = btn.textContent.toLowerCase().trim();
-                candidates.push(txt);
-                
-                // 匹配多种可能的按钮文本
-                if (txt.includes("authorize") || 
-                    txt.includes("授权") || 
-                    txt.includes("allow") ||
-                    txt.includes("continue") ||
-                    txt.includes("log in") ||
-                    txt.includes("login") ||
-                    txt === "yes" ||
-                    txt === "确认") {
-                    btn.click();
-                    return {clicked: true, text: btn.textContent.trim(), matched: txt};
-                }
-            }
-            
-            // 兜底：找 submit 按钮
-            const submit = document.querySelector('button[type="submit"]');
-            if (submit) {
-                submit.click();
-                return {clicked: true, text: submit.textContent.trim(), matched: "submit fallback"};
-            }
-            
-            return {clicked: false, candidates: candidates.slice(0, 10)};
-        }""")
-        print(f"  授权结果: {auth_result}")
-        time.sleep(10)
-        
-        # ==================== Step 8: 等待回到 Kerit ====================
-        print("\n📌 Step 8: 等待重定向回 Kerit...")
-        
-        # 给页面一些时间跳转
-        for _ in range(20):
-            current_url = page.url
-            print(f"  当前 URL: {current_url[:100]}")
-            
-            if "billing.kerit.cloud" in current_url and "discord" not in current_url:
-                if "clientarea" in current_url or "dashboard" in current_url or "/auth/discord/callback" in current_url:
-                    print(f"  ✅ 成功回到 Kerit！")
+            page.wait_for_selector('.otp-input', state='visible', timeout=30000)
+        except Exception:
+            print("❌ OTP框加载失败")
+            page.screenshot(path="kerit_no_otp.png")
+            send_wechat("❌ OTP框加载失败")
+            return
+
+        try:
+            code = fetch_otp_from_gmail(wait_seconds=60)
+        except TimeoutError as e:
+            print(e)
+            page.screenshot(path="kerit_otp_timeout.png")
+            send_wechat("❌ Gmail OTP获取超时")
+            return
+
+        otp_inputs = page.locator('.otp-input').all()
+        if len(otp_inputs) < 4:
+            print(f"❌ OTP框不足: {len(otp_inputs)}")
+            send_wechat(f"❌ OTP框数量不足（{len(otp_inputs)}）")
+            return
+
+        print(f"⌨️ 填入OTP: {code}")
+        for i, char in enumerate(code):
+            js = f"""
+                (function() {{
+                    var inputs = document.querySelectorAll('.otp-input');
+                    var inp = inputs[{i}];
+                    if (!inp) return;
+                    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(inp, '{char}');
+                    inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }})();
+            """
+            page.evaluate(js)
+            time.sleep(0.1)
+
+        print("✅ OTP已填入")
+        time.sleep(0.5)
+
+        print("🚀 点击验证...")
+        verify_clicked = False
+        for selector in [
+            'button:has-text("Verify Code")',
+            'a:has-text("Verify Code")',
+            'button[type="submit"]',
+        ]:
+            try:
+                if page.locator(selector).count() > 0:
+                    page.click(selector, timeout=10000)
+                    verify_clicked = True
                     break
-            
-            if "discord.com/oauth2" in current_url:
-                print("  🔄 仍在 OAuth2 页面，等待中...")
-            
-            time.sleep(2)
+            except Exception:
+                continue
+
+        if not verify_clicked:
+            result = page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const btn of buttons) {
+                    if (btn.textContent.toLowerCase().includes('verify') || 
+                        btn.textContent.toLowerCase().includes('verify code')) {
+                        btn.click();
+                        return {found: true, text: btn.textContent.trim()};
+                    }
+                }
+                return {found: false};
+            }""")
+            verify_clicked = result.get("found", False)
+
+        if not verify_clicked:
+            print("❌ 验证按钮缺失")
+            page.screenshot(path="kerit_no_verify_btn.png")
+            send_wechat("❌ 验证按钮缺失")
+            return
+
+        print("⏳ 等待登录跳转...")
+        for _ in range(80):
+            try:
+                url = page.url
+                if "/session" in url:
+                    print("✅ 登录成功！")
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
         else:
-            print("  ⚠️ 跳转超时，检查最终状态...")
-        
-        # 最终检查
-        final_url = page.url
-        print(f"  最终 URL: {final_url}")
-        
-        if "kerit" in final_url and "login" not in final_url and "oauth2" not in final_url:
-            print("  ✅ 判断为登录成功！")
-        elif "billing.kerit.cloud/auth/discord/callback" in final_url:
-            print("  ✅ 已收到 Discord 回调，等待页面加载...")
-            time.sleep(5)
-        else:
-            print("❌ 登录流程未完成")
-            page.screenshot(path="error_final.png")
-            sys.exit(1)
-        
+            print("❌ 登录等待超时")
+            page.screenshot(path="kerit_login_timeout.png")
+            send_wechat("❌ 登录等待超时")
+            return
+
+        # ── 执行续期 ─────────────────────────────────────────
+        do_renew(page)
+
         # 保存会话
         context.storage_state(path="kerit_auth.json")
         print("\n" + "=" * 60)
-        print("🎉 完美通关！会话已保存至 kerit_auth.json")
+        print("🎉 任务完成！会话已保存至 kerit_auth.json")
         print("=" * 60)
-        
+
     except Exception as e:
         print(f"\n❌ 自动化链条断裂: {str(e)}")
         try:
