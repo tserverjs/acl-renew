@@ -52,26 +52,26 @@ jobs:
       env:
         DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
       run: |
-        # 1. 建立虚拟屏幕 (必须注入 -extension RANDR 保证 ffmpeg 录制平滑)
+        # 1. 建立虚拟屏幕 (注入 -extension RANDR 允许高级窗口管理器控制)
         Xvfb :99 -ac -screen 0 1920x1080x24 +extension RANDR > /dev/null 2>&1 &
         sleep 3
         
         # 2. 全局声明环境变量
         export DISPLAY=:99
         
-        # 3. 启动 ffmpeg（显式传入环境变量，防止其迷路）
+        # 3. 启动 ffmpeg 进行桌面捕获
         echo "🎥 正在初始化屏幕录像机..."
         DISPLAY=:99 ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 -codec:v libx264 -pix_fmt yuv420p cloak_run_record.mp4 > ffmpeg.log 2>&1 &
         FFMPEG_PID=$!
         sleep 2
 
-        # 4. 后台窗口最大化守护进程（显式传入 DISPLAY=:99）
+        # 4. 后台窗口最大化守护进程（扩大扫描周期至 30 秒，确保捕获到 Headed 浏览器）
         (
           export DISPLAY=:99
-          for i in {1..15}; do
-            sleep 2
+          for i in {1..30}; do
+            sleep 1
             if wmctrl -l 2>/dev/null | grep -iE "chrome|chromium|cloak|kerit" > /dev/null; then
-              echo "🎯 检测到浏览器窗口，正在执行物理全屏最大化..."
+              echo "🎯 成功捕获到物理浏览器窗口，正在执行全屏最大化..."
               wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz || true
               break
             fi
@@ -80,7 +80,7 @@ jobs:
 
         # 5. 执行核心自动化登录脚本
         echo "🚀 开始运行 CloakBrowser 自动化脚本..."
-        python auto-renew.py || touch .script_failed
+        python cloak_discord.py || touch .script_failed
 
         # 6. 优雅停止录像
         echo "🛑 脚本运行完毕，正在保存录像..."
