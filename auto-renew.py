@@ -42,25 +42,32 @@ def send_wechat(result, server_id=None, remaining=None):
     if not WECHAT_WEBHOOK:
         print("⚠️ 企业微信未配置，跳过推送")
         return
-
-    # 构建纯文本消息
+    
     lines = [
-        "【Kerit 服务器续期通知】",
-        f"运行时间: {now_str()}",
+        f"🎮 <font color='info'>Kerit 服务器续期通知</font>",
+        f"🕐 运行时间: {now_str()}",
     ]
     if server_id is not None:
-        lines.append(f"服务器ID: {server_id}")
-
-    lines.append(f"续期结果: {result}")
+        lines.append(f"🖥 服务器ID: {server_id}")
+    
+    # 根据结果设置颜色
+    if "成功" in result or "✅" in result:
+        color = "info"
+    elif "失败" in result or "❌" in result:
+        color = "warning"
+    else:
+        color = "comment"
+    
+    lines.append(f"📊 续期结果: <font color='{color}'>{result}</font>")
     if remaining is not None:
-        lines.append(f"剩余天数: {remaining}天")
-
-    msg = "
-".join(lines)
-
+        lines.append(f"⏱️ 剩余天数: {remaining}天")
+    
+    # ✅ 修正点：确保此行不换行，直接拼接
+    msg = "\n".join(lines)
+    
     payload = {
-        "msgtype": "text",
-        "text": {
+        "msgtype": "markdown",
+        "markdown": {
             "content": msg
         }
     }
@@ -580,6 +587,7 @@ def main():
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            "--start-maximized",  # ✅ 增加最大化参数，保证 xdotool 坐标映射更稳定
         ],
     )
     
@@ -674,7 +682,6 @@ def main():
             return
 
         print("⏳ 等待页面跳转/OTP框出现...")
-        # 等待网络请求完成，页面可能正在跳转
         try:
             page.wait_for_load_state('networkidle', timeout=15000)
         except Exception:
