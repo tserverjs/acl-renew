@@ -57,7 +57,7 @@ jobs:
 
     - name: Install Python Dependencies
       run: |
-        pip install cloakbrowser 
+        pip install cloakbrowser
 
     - name: 🎬 启动虚拟桌面并执行自动化
       env:
