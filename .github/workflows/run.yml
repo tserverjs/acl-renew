@@ -20,10 +20,15 @@ jobs:
     - name: 📦 安装系统底层依赖
       run: |
         sudo apt-get update -y
+        # 1. 自动接受微软字体受体协议
+        echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | sudo debconf-set-selections
+        # 2. 安装系统底层依赖和微软核心字体库
         sudo apt-get install -y \
           xvfb curl wget wmctrl ffmpeg scrot \
           fonts-noto-color-emoji xdotool \
-          x11-utils x11-xserver-utils
+          x11-utils x11-xserver-utils ttf-mscorefonts-installer
+        # 3. 刷新系统字体缓存
+        sudo fc-cache -f -v
 
     - name: 🌐 启动GOST代理
       env:
