@@ -1,543 +1,381 @@
-#!/usr/bin/env python3
-"""
-Kerit Cloud Billing 自动续期 - CloakBrowser + Email OTP 版
-"""
-
 import os
 import sys
 import time
-import json
-import imaplib
-import email
-import re
-import urllib.request
-import urllib.parse
-import traceback
-from datetime import datetime
-from pathlib import Path
+from cloakbrowser import launch_persistent_context
 
-from cloakbrowser import launch
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+LOCAL_SOCKS5 = "socks5://127.0.0.1:40000"
+PROFILE_DIR = "./cloak-profile"
 
 
-# ============================================================
-# 配置
-# ============================================================
-
-# Kerit 账号 (环境变量: KERIT_ACCOUNT=email@gmail.com,app_password)
-_account = os.environ.get("KERIT_ACCOUNT", "").split(",")
-if len(_account) < 2:
-    print("❌ KERIT_ACCOUNT 格式错误: email@gmail.com,app_password")
-    sys.exit(1)
-
-KERIT_EMAIL = _account[0].strip()
-GMAIL_PASSWORD = _account[1].strip()
-MASKED_EMAIL = "******@" + KERIT_EMAIL.split("@")[1]
-
-# 代理 (Gost SOCKS5)
-PROXY_URL = "socks5://127.0.0.1:40000"
-
-# URL
-LOGIN_URL = "https://billing.kerit.cloud/"
-FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
-
-# Telegram
-_tg_raw = os.environ.get("TG_BOT", "")
-TG_CHAT_ID, TG_TOKEN = "", ""
-if _tg_raw and "," in _tg_raw:
-    _tg = _tg_raw.split(",")
-    TG_CHAT_ID = _tg[0].strip()
-    TG_TOKEN = _tg[1].strip()
-
-# 截图目录
-SCREENSHOT_DIR = Path("screenshots")
-SCREENSHOT_DIR.mkdir(exist_ok=True)
-
-
-# ============================================================
-# 工具函数
-# ============================================================
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-
-def save_screenshot(page, name):
-    try:
-        path = SCREENSHOT_DIR / f"{name}_{datetime.now().strftime('%H%M%S')}.png"
-        page.screenshot(path=str(path))
-        log(f"📸 {path}")
-        return str(path)
-    except Exception as e:
-        log(f"⚠️ 截图失败: {e}")
-        return None
-
-def send_tg(result, server_id=None, remaining=None):
-    lines = [
-        f"🎮 Kerit 续期通知",
-        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-    ]
-    if server_id is not None:
-        lines.append(f"🖥 服务器ID: {server_id}")
-    lines.append(f"📊 {result}")
-    if remaining is not None:
-        lines.append(f"⏱️ 剩余: {remaining}天")
+def inject_discord_token(page, token):
+    """
+    全面注入 Discord Token 到所有可能的位置。
+    Discord 2024+ 的安全策略要求多位置注入。
+    """
+    # 清理 Token（去掉两端引号）
+    clean_token = token.strip().strip('"').strip("'")
     
-    msg = "\n".join(lines)
-    log(msg)
+    if len(clean_token) < 50:
+        print("  ⚠️ Token 长度异常，可能无效！")
     
-    if not TG_TOKEN or not TG_CHAT_ID:
-        log("⚠️ TG未配置")
-        return
+    print(f"  🔑 注入 Token (前15位): {clean_token[:15]}...")
     
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id": TG_CHAT_ID,
-            "text": msg,
-        }).encode()
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            log("📨 TG推送成功")
-    except Exception as e:
-        log(f"⚠️ TG推送失败: {e}")
-
-
-# ============================================================
-# Gmail OTP
-# ============================================================
-
-def extract_email_body(msg):
-    body = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                break
-        if not body:
-            for part in msg.walk():
-                if part.get_content_type() == "text/html":
-                    html = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                    body = re.sub(r'<[^>]+>', ' ', html)
-                    break
-    else:
-        body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-    return body
-
-
-def fetch_otp_from_gmail(wait_seconds=90) -> str:
-    log(f"📬 连接 Gmail，等待 OTP ({wait_seconds}s)...")
-    deadline = time.time() + wait_seconds
-
-    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
-    mail.login(KERIT_EMAIL, GMAIL_PASSWORD)
-    log("✅ Gmail 登录成功")
-
-    # 查找垃圾邮件文件夹
-    spam_folder = None
-    _, folder_list = mail.list()
-    for f in folder_list:
-        decoded = f.decode("utf-8", errors="ignore")
-        if any(k in decoded.lower() for k in ["spam", "junk", "垃圾"]):
-            match = re.search(r'"([^"]+)"\s*$', decoded)
-            if not match:
-                match = re.search(r'(\S+)\s*$', decoded)
-            if match:
-                spam_folder = match.group(1).strip('"')
-                log(f"🗑️ 垃圾邮件文件夹: {spam_folder}")
-                break
-
-    folders_to_check = ["INBOX"]
-    if spam_folder:
-        folders_to_check.append(spam_folder)
-
-    seen_uids = {}
-    for folder in folders_to_check:
-        try:
-            status, _ = mail.select(folder)
-            if status == "OK":
-                _, data = mail.uid("search", None, "ALL")
-                seen_uids[folder] = set(data[0].split())
-        except Exception:
-            seen_uids[folder] = set()
-
-    # 轮询新邮件
-    while time.time() < deadline:
-        time.sleep(5)
-
-        for folder in folders_to_check:
-            try:
-                status, _ = mail.select(folder)
-                if status != "OK":
-                    continue
-                
-                _, data = mail.uid("search", None, 'FROM "kerit"')
-                all_uids = set(data[0].split())
-                new_uids = all_uids - seen_uids[folder]
-
-                for uid in new_uids:
-                    seen_uids[folder].add(uid)
-                    _, msg_data = mail.uid("fetch", uid, "(RFC822)")
-                    raw = msg_data[0][1]
-                    msg = email.message_from_bytes(raw)
-                    body = extract_email_body(msg)
-                    
-                    otp_match = re.search(r'\b(\d{4})\b', body)
-                    if otp_match:
-                        code = otp_match.group(1)
-                        log(f"✅ OTP: {code}")
-                        mail.logout()
-                        return code
-
-            except Exception:
-                continue
-
-    mail.logout()
-    raise TimeoutError("❌ Gmail OTP 超时")
-
-
-# ============================================================
-# 续期核心
-# ============================================================
-
-def extract_remaining_days(page) -> int:
-    try:
-        return page.evaluate("""() => {
-            const el = document.getElementById('expiry-display');
-            return el ? parseInt(el.innerText || "0") : 0;
-        }""") or 0
-    except Exception:
-        return 0
-
-
-def do_renew(page):
-    log("🔄 进入续期页面...")
-    page.goto(FREE_PANEL_URL, wait_until="networkidle")
-    time.sleep(3)
-    save_screenshot(page, "free_panel")
-
-    # 获取服务器ID
-    server_id = page.evaluate("""() => {
-        return typeof serverData !== 'undefined' ? serverData.id : null;
-    }""")
-
-    if not server_id:
-        log("❌ 无法获取 serverData.id")
-        save_screenshot(page, "no_server_id")
-        send_tg("❌ serverData.id 缺失")
-        return
-
-    log(f"🆔 服务器ID: {server_id}")
-
-    initial_count = page.evaluate("""() => {
-        const el = document.getElementById('renewal-count');
-        return el ? parseInt(el.innerText || "0") : 0;
-    }""")
-
-    initial_remaining = extract_remaining_days(page)
-    need = 7 - initial_count
-
-    log(f"📊 进度: {initial_count}/7，剩余: {initial_remaining}天，需续期: {need}次")
-
-    if initial_remaining >= 7:
-        log("✅ 剩余天数已满，无需续期")
-        save_screenshot(page, "renew_skip")
-        send_tg("✅ 无需续期", server_id, initial_remaining)
-        return
-
-    if need <= 0:
-        log("🎉 已达上限")
-        save_screenshot(page, "renew_full")
-        send_tg("✅ 已达上限", server_id, extract_remaining_days(page))
-        return
-
-    # 循环续期
-    for attempt in range(need):
-        count = page.evaluate("""() => {
-            const el = document.getElementById('renewal-count');
-            return el ? parseInt(el.innerText || "0") : 0;
-        }""")
-
-        log(f"📊 当前: {count}/7")
-
-        if count >= 7:
-            log("🎉 已达上限")
-            send_tg("✅ 续期完成", server_id, extract_remaining_days(page))
-            return
-
-        log(f"🔁 第 {attempt + 1}/{need} 次续期...")
-
-        # 点击 Renew Server
-        renew_clicked = False
-        for sel in [
-            'button:has-text("Renew Server")',
-            'a:has-text("Renew Server")',
-            'button:has-text("Renew")',
-        ]:
-            if page.locator(sel).count() > 0:
-                page.locator(sel).first.click()
-                renew_clicked = True
-                log("✅ 点击 Renew Server")
-                break
+    result = page.evaluate("""(token) => {
+        const t = token;
+        const results = [];
         
-        if not renew_clicked:
-            result = page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button, a'));
-                const btn = btns.find(b => b.textContent.includes('Renew'));
-                if (btn) { btn.click(); return true; }
-                return false;
-            }""")
-            if result:
-                renew_clicked = True
-                log("✅ JS 点击 Renew")
+        // 1. localStorage - 标准位置
+        try { 
+            localStorage.setItem("token", '"' + t + '"'); 
+            results.push("localStorage: OK");
+        } catch(e) { results.push("localStorage: FAIL - " + e.message); }
+        
+        // 2. sessionStorage
+        try { 
+            sessionStorage.setItem("token", '"' + t + '"'); 
+            results.push("sessionStorage: OK");
+        } catch(e) { results.push("sessionStorage: FAIL - " + e.message); }
+        
+        // 3. Cookie（多域名覆盖）
+        try { 
+            document.cookie = "token=" + encodeURIComponent('"' + t + '"') + "; path=/; domain=.discord.com";
+            document.cookie = "token=" + encodeURIComponent('"' + t + '"') + "; path=/; domain=discord.com";
+            results.push("Cookie: OK");
+        } catch(e) { results.push("Cookie: FAIL - " + e.message); }
+        
+        // 4. 覆盖 Discord 内部 webpack 模块的 getToken
+        try {
+            if (window.webpackChunkdiscord_app) {
+                window.webpackChunkdiscord_app.push([
+                    [Math.random()], {}, 
+                    req => {
+                        for (const m of Object.keys(req.c || {})) {
+                            const mod = req.c[m].exports;
+                            if (mod && mod.default && typeof mod.default.getToken === 'function') {
+                                mod.default.getToken = () => t;
+                            }
+                            if (mod && typeof mod.getToken === 'function') {
+                                mod.getToken = () => t;
+                            }
+                        }
+                    }
+                ]);
+                results.push("webpack: OK");
+            } else {
+                results.push("webpack: SKIP (not loaded)");
+            }
+        } catch(e) { results.push("webpack: FAIL - " + e.message); }
+        
+        // 5. 直接设置 window 对象
+        try { 
+            window.token = t; 
+            window.__DISCORD_TOKEN__ = t;
+            results.push("window: OK");
+        } catch(e) { results.push("window: FAIL - " + e.message); }
+        
+        // 6. 尝试设置 document.defaultView
+        try {
+            if (document.defaultView) {
+                document.defaultView.localStorage.setItem("token", '"' + t + '"');
+                results.push("defaultView: OK");
+            }
+        } catch(e) { results.push("defaultView: FAIL - " + e.message); }
+        
+        return results;
+    }""", clean_token)
+    
+    for r in result:
+        print(f"    {r}")
+    print("  ✅ Token 注入完成")
 
-        if not renew_clicked:
-            log("❌ 找不到 Renew 按钮")
-            save_screenshot(page, f"no_renew_btn_{attempt}")
-            send_tg(f"❌ 无Renew按钮 #{attempt+1}", server_id)
-            return
 
-        time.sleep(3)
-
-        # CloakBrowser 自动处理 Turnstile
-        log("⏳ 等待 Turnstile...")
-        time.sleep(5)
-
-        # 获取 Token
-        token = page.evaluate("""() => {
-            const input = document.querySelector('input[name="cf-turnstile-response"]');
-            return input ? input.value : '';
-        }""")
-
-        if not token or len(token) < 20:
-            log("⚠️ Token 未就绪，等待...")
-            time.sleep(5)
-            token = page.evaluate("""() => {
-                const input = document.querySelector('input[name="cf-turnstile-response"]');
-                return input ? input.value : '';
-            }""")
-
-        if not token or len(token) < 20:
-            log("❌ Token 获取失败")
-            save_screenshot(page, f"token_fail_{attempt}")
-            send_tg(f"❌ Token失败 #{attempt+1}", server_id)
+def wait_for_cloudflare(page, timeout=90):
+    """
+    等待 Cloudflare 验证完成。
+    验证通过后页面会在根路径 / 上显示登录界面。
+    """
+    print("⏳ 等待 Cloudflare 验证完成...")
+    start = time.time()
+    
+    while time.time() - start < timeout:
+        url = page.url
+        title = page.title()
+        content = ""
+        try:
+            content = page.content()
+        except:
+            pass
+        
+        # 检查是否还在验证页
+        if any(x in title.lower() for x in ["just a moment", "security verification", "verifying"]):
+            print(f"  🔄 仍在验证页... ({int(time.time()-start)}s)")
+            time.sleep(2)
             continue
-
-        log(f"✅ Token: {token[:20]}...")
-
-        # 提交续期 API
-        log("🎯 提交续期...")
-        result = page.evaluate(f"""async () => {{
-            try {{
-                const res = await fetch('/api/renew', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    credentials: 'include',
-                    body: JSON.stringify({{ id: '{server_id}', captcha: '{token}' }})
-                }});
-                return await res.json();
-            }} catch(e) {{
-                return {{error: e.message}};
-            }}
-        }}""")
-
-        log(f"📨 API: {json.dumps(result)[:200]}")
-
-        # 关闭弹窗
-        page.evaluate("""() => {
-            document.querySelector('[data-bs-dismiss="modal"]')?.click();
-        }""")
-
-        # 刷新
+        
+        # 检查是否已显示登录界面
+        if "billing.kerit.cloud" in url:
+            has_discord = "continue with discord" in content.lower()
+            has_email = "continue with email" in content.lower() or "email address" in content.lower()
+            has_cf_success = "成功" in content or "success" in content.lower()
+            
+            if has_discord or has_email or has_cf_success:
+                print(f"  ✅ 登录界面已加载！")
+                return True
+        
         time.sleep(2)
-        page.reload(wait_until="networkidle")
-        time.sleep(3)
-        save_screenshot(page, f"after_renew_{attempt}")
-
-    # 最终结果
-    save_screenshot(page, "renew_done")
-    final_count = page.evaluate("""() => {
-        const el = document.getElementById('renewal-count');
-        return el ? parseInt(el.innerText || "0") : 0;
-    }""")
-    final_remaining = extract_remaining_days(page)
-
-    log(f"📊 最终: {final_count}/7，剩余: {final_remaining}天")
-
-    if final_count >= 7:
-        send_tg("✅ 续期完成", server_id, final_remaining)
-    else:
-        send_tg(f"⚠️ 未完成 ({final_count}/7)", server_id, final_remaining)
-
-
-# ============================================================
-# 主流程
-# ============================================================
-
-def run():
-    log("=" * 60)
-    log("🚀 Kerit Cloud 自动续期 (CloakBrowser + Email OTP)")
-    log(f"📧 {MASKED_EMAIL}")
-    log(f"🌐 {PROXY_URL}")
-    log("=" * 60)
-
-    log("🔧 启动 CloakBrowser...")
     
-    browser = launch(
-        headless=False,      # Xvfb 提供虚拟显示
-        humanize=True,       # 人类化行为
-        proxy=PROXY_URL,     # Gost SOCKS5
-        geoip=True,
+    print(f"  ⚠️ 等待超时，当前 URL: {page.url}")
+    return False
+
+
+def main():
+    if not DISCORD_TOKEN:
+        print("❌ 错误: 未配置 DISCORD_TOKEN 环境变量！")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("🚀 启动 CloakBrowser + Kerit 自动登录")
+    print("=" * 60)
+    
+    os.environ["CLOAKBROWSER_SUPPRESS_FONT_WARNING"] = "1"
+    
+    context = launch_persistent_context(
+        PROFILE_DIR,
+        headless=False,
+        humanize=True,
+        human_preset="careful",
+        proxy={"server": LOCAL_SOCKS5},
+        # geoip=True,  # 禁用，避免 Failed to discover exit IP 错误
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+        timezone_id="America/New_York",
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ],
     )
+    
+    page = context.new_page()
 
     try:
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-        )
-        
-        page = context.new_page()
-
-        # ── IP 验证 ──
-        log("🌐 验证出口IP...")
-        try:
-            page.goto("https://api.ipify.org?format=json", wait_until="networkidle")
-            ip_text = page.text_content("body")
-            ip_text = re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'\1xx', ip_text)
-            log(f"✅ 出口IP: {ip_text}")
-        except Exception:
-            log("⚠️ IP验证失败")
-
-        # ── 打开登录页 ──
-        log("🔑 打开 billing.kerit.cloud...")
-        page.goto(LOGIN_URL, wait_until="networkidle")
+        # ==================== Step 1: 打开 Kerit 首页 ====================
+        print("\n📌 Step 1: 打开 Kerit 首页...")
+        page.goto("https://billing.kerit.cloud/", wait_until="domcontentloaded")
         time.sleep(3)
-        save_screenshot(page, "login_page")
-
-        # 等待 Cloudflare
-        log("⏳ 等待页面稳定...")
-        time.sleep(3)
-
-        # ── 输入邮箱 ──
-        log("📭 查找邮箱输入框...")
         
-        for _ in range(20):
-            if page.locator("#email-input").count() > 0:
-                break
-            time.sleep(0.5)
-        else:
-            log("❌ 邮箱框未找到")
-            save_screenshot(page, "no_email")
-            send_tg("❌ 邮箱框未找到")
-            return
-
-        # CloakBrowser type 模拟人类打字
-        page.locator("#email-input").type(KERIT_EMAIL, delay=50)
-        log(f"✅ 邮箱: {MASKED_EMAIL}")
-
-        # ── 点击 Continue ──
-        log("🖱️ 点击 Continue...")
+        # ==================== Step 2: 等待 Cloudflare 验证 ====================
+        print("\n📌 Step 2: 等待 Cloudflare 验证...")
+        if not wait_for_cloudflare(page, timeout=90):
+            print("⚠️ 验证超时，尝试刷新...")
+            page.reload(wait_until="domcontentloaded")
+            time.sleep(5)
+            if not wait_for_cloudflare(page, timeout=30):
+                print("❌ 无法通过 Cloudflare 验证")
+                sys.exit(1)
         
-        for sel in ['button:has-text("Continue with Email")', 'button[type="submit"]']:
-            if page.locator(sel).count() > 0:
-                page.locator(sel).first.click()
-                log("✅ Continue 已点击")
-                break
-        else:
-            page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button'));
-                const btn = btns.find(b => b.textContent.includes('Continue'));
-                btn?.click();
+        page.screenshot(path="debug_login_page.png")
+        print("  📸 已保存调试截图: debug_login_page.png")
+        
+        # ==================== Step 3: 点击 Discord 登录 ====================
+        print("\n📌 Step 3: 点击 Discord 登录...")
+        
+        discord_selectors = [
+            'button:has-text("Continue with Discord")',
+            'a:has-text("Continue with Discord")',
+            '[class*="discord" i]',
+            'button:has-text("Discord")',
+            'a:has-text("Discord")',
+        ]
+        
+        clicked = False
+        for selector in discord_selectors:
+            try:
+                if page.locator(selector).count() > 0:
+                    print(f"  ✅ 找到 Discord 按钮: {selector}")
+                    page.click(selector, timeout=10000)
+                    clicked = True
+                    break
+            except Exception as e:
+                print(f"  ❌ 选择器失败 {selector}: {e}")
+        
+        if not clicked:
+            print("  📟 执行 JS 兜底...")
+            result = page.evaluate("""() => {
+                const links = Array.from(document.querySelectorAll('a, button'));
+                const discordLink = links.find(el => 
+                    el.textContent.toLowerCase().includes('continue with discord') ||
+                    el.textContent.toLowerCase().includes('discord')
+                );
+                if (discordLink) {
+                    discordLink.click();
+                    return {found: true, text: discordLink.textContent.trim(), tag: discordLink.tagName};
+                }
+                return {found: false, html: document.body.innerText.substring(0, 300)};
             }""")
-
-        # ── 等待 OTP 框 ──
-        log("📨 等待 OTP 输入框...")
-        for _ in range(30):
-            if page.locator(".otp-input").count() >= 4:
-                break
-            time.sleep(1)
-        else:
-            log("❌ OTP框未出现")
-            save_screenshot(page, "no_otp")
-            send_tg("❌ OTP框未出现")
-            return
-
-        # ── 获取 OTP ──
-        try:
-            code = fetch_otp_from_gmail(wait_seconds=90)
-        except TimeoutError as e:
-            log(str(e))
-            save_screenshot(page, "otp_timeout")
-            send_tg("❌ OTP超时")
-            return
-
-        # ── 填入 OTP ──
-        log(f"⌨️ 填入 OTP: {code}")
+            print(f"  JS 结果: {result}")
+            clicked = result.get("found", False)
+            time.sleep(3)
         
-        otp_inputs = page.locator(".otp-input").all()
-        if len(otp_inputs) < 4:
-            log(f"❌ OTP框不足: {len(otp_inputs)}")
-            send_tg(f"❌ OTP框不足")
-            return
-
-        for i, char in enumerate(code):
-            otp_inputs[i].type(char, delay=100)
-            time.sleep(0.1)
-
-        log("✅ OTP 已填入")
-
-        # ── 点击 Verify ──
-        log("🚀 点击 Verify...")
+        if not clicked:
+            print("❌ 无法找到 Discord 登录入口！")
+            page.screenshot(path="error_no_discord.png")
+            sys.exit(1)
         
-        for sel in ['button:has-text("Verify")', 'button[type="submit"]']:
-            if page.locator(sel).count() > 0:
-                page.locator(sel).first.click()
-                log("✅ Verify 已点击")
-                break
-        else:
-            page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button'));
-                const btn = btns.find(b => b.textContent.includes('Verify'));
-                btn?.click();
-            }""")
-
-        # ── 等待登录成功 ──
-        log("⏳ 等待登录跳转...")
-        for _ in range(60):
-            url = page.url
-            if "/session" in url or "/dashboard" in url or "/free" in url:
-                log(f"✅ 登录成功: {url}")
-                break
-            time.sleep(1)
-        else:
-            log("❌ 登录超时")
-            save_screenshot(page, "login_timeout")
-            send_tg("❌ 登录超时")
-            return
-
-        save_screenshot(page, "logged_in")
-
-        # ── 保存认证状态 ──
-        log("💾 保存认证状态...")
+        # ==================== Step 4: 等待跳转到 Discord ====================
+        print("\n📌 Step 4: 等待 Discord 页面...")
         try:
-            storage = context.storage_state()
-            with open("kerit_auth.json", "w") as f:
-                json.dump(storage, f, indent=2)
-            log("✅ 认证状态已保存")
+            page.wait_for_url(lambda url: "discord.com" in url, timeout=40000)
+            print(f"  ✅ 已进入 Discord: {page.url[:80]}...")
         except Exception as e:
-            log(f"⚠️ 保存失败: {e}")
-
-        # ── 执行续期 ──
-        do_renew(page)
-
-    except Exception as e:
-        log(f"💥 错误: {e}")
-        log(traceback.format_exc())
-        save_screenshot(page, "fatal_error")
-        send_tg(f"💥 错误: {str(e)[:100]}")
-        sys.exit(1)
+            print(f"  ❌ 未跳转到 Discord: {e}")
+            print(f"  当前 URL: {page.url}")
+            page.screenshot(path="error_discord_redirect.png")
+            sys.exit(1)
         
+        time.sleep(3)
+        
+        # ==================== Step 5: 访问 Discord 主站注入 Token ====================
+        print("\n📌 Step 5: 访问 Discord 主站并注入 Token...")
+        
+        # 先访问 Discord app 页面，确保在正确的域下
+        page.goto("https://discord.com/app", wait_until="domcontentloaded")
+        time.sleep(5)
+        
+        # 注入 Token
+        inject_discord_token(page, DISCORD_TOKEN)
+        
+        # 刷新确认登录状态
+        print("  🔄 刷新页面验证登录状态...")
+        page.reload(wait_until="domcontentloaded")
+        time.sleep(8)
+        
+        # 检查是否已登录（URL 应该变成 /channels/@me 或 /app，而不是 /login）
+        current_url = page.url
+        print(f"  当前 URL: {current_url}")
+        
+        if "discord.com/login" in current_url:
+            print("❌ Token 无效或已过期，仍然需要登录！")
+            page.screenshot(path="error_discord_login.png")
+            sys.exit(1)
+        
+        if "/app" in current_url or "/channels" in current_url or "/library" in current_url:
+            print("  ✅ Discord 登录成功！")
+        else:
+            print("  ⚠️ Discord 状态不确定，继续尝试...")
+        
+        # ==================== Step 6: 前往 OAuth2 授权页 ====================
+        print("\n📌 Step 6: 前往 Kerit OAuth2 授权页...")
+        
+        oauth_url = ("https://discord.com/oauth2/authorize"
+                     "?client_id=1432019029245038835"
+                     "&redirect_uri=https%3A%2F%2Fbilling.kerit.cloud%2Fauth%2Fdiscord%2Fcallback"
+                     "&response_type=code"
+                     "&scope=identify+email"
+                     "&prompt=consent"
+                     "&state=login")
+        
+        page.goto(oauth_url, wait_until="domcontentloaded")
+        time.sleep(5)
+        
+        # ==================== Step 7: 处理 OAuth2 授权 ====================
+        print("\n📌 Step 7: 处理 Discord OAuth2 授权...")
+        
+        # 先截图看当前状态
+        page.screenshot(path="debug_oauth2_page.png")
+        print("  📸 已保存 OAuth2 页面截图: debug_oauth2_page.png")
+        
+        # 滚动到底部确保按钮可见
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        
+        # 尝试点击授权按钮（支持多种文本）
+        auth_result = page.evaluate("""() => {
+            const buttons = document.querySelectorAll("button, a[role='button']");
+            const candidates = [];
+            
+            for (const btn of buttons) {
+                const txt = btn.textContent.toLowerCase().trim();
+                candidates.push(txt);
+                
+                // 匹配多种可能的按钮文本
+                if (txt.includes("authorize") || 
+                    txt.includes("授权") || 
+                    txt.includes("allow") ||
+                    txt.includes("continue") ||
+                    txt.includes("log in") ||
+                    txt.includes("login") ||
+                    txt === "yes" ||
+                    txt === "确认") {
+                    btn.click();
+                    return {clicked: true, text: btn.textContent.trim(), matched: txt};
+                }
+            }
+            
+            // 兜底：找 submit 按钮
+            const submit = document.querySelector('button[type="submit"]');
+            if (submit) {
+                submit.click();
+                return {clicked: true, text: submit.textContent.trim(), matched: "submit fallback"};
+            }
+            
+            return {clicked: false, candidates: candidates.slice(0, 10)};
+        }""")
+        print(f"  授权结果: {auth_result}")
+        time.sleep(10)
+        
+        # ==================== Step 8: 等待回到 Kerit ====================
+        print("\n📌 Step 8: 等待重定向回 Kerit...")
+        
+        # 给页面一些时间跳转
+        for _ in range(20):
+            current_url = page.url
+            print(f"  当前 URL: {current_url[:100]}")
+            
+            if "billing.kerit.cloud" in current_url and "discord" not in current_url:
+                if "clientarea" in current_url or "dashboard" in current_url or "/auth/discord/callback" in current_url:
+                    print(f"  ✅ 成功回到 Kerit！")
+                    break
+            
+            if "discord.com/oauth2" in current_url:
+                print("  🔄 仍在 OAuth2 页面，等待中...")
+            
+            time.sleep(2)
+        else:
+            print("  ⚠️ 跳转超时，检查最终状态...")
+        
+        # 最终检查
+        final_url = page.url
+        print(f"  最终 URL: {final_url}")
+        
+        if "kerit" in final_url and "login" not in final_url and "oauth2" not in final_url:
+            print("  ✅ 判断为登录成功！")
+        elif "billing.kerit.cloud/auth/discord/callback" in final_url:
+            print("  ✅ 已收到 Discord 回调，等待页面加载...")
+            time.sleep(5)
+        else:
+            print("❌ 登录流程未完成")
+            page.screenshot(path="error_final.png")
+            sys.exit(1)
+        
+        # 保存会话
+        context.storage_state(path="kerit_auth.json")
+        print("\n" + "=" * 60)
+        print("🎉 完美通关！会话已保存至 kerit_auth.json")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\n❌ 自动化链条断裂: {str(e)}")
+        try:
+            page.screenshot(path="error_screenshot.png")
+            print("📸 错误截图已保存: error_screenshot.png")
+        except:
+            pass
+        sys.exit(1)
     finally:
-        browser.close()
-        log("🔒 浏览器已关闭")
+        context.close()
 
 
 if __name__ == "__main__":
-    run()
+    main()
