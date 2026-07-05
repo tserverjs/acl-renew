@@ -7,6 +7,7 @@ import re
 import subprocess
 import json
 import urllib.request
+import urllib.parse
 from cloakbrowser import launch_persistent_context
 
 # ============================================================
@@ -26,8 +27,7 @@ LOGIN_URL      = "https://billing.kerit.cloud/"
 FREE_PANEL_URL = "https://billing.kerit.cloud/free_panel"
 
 # 企业微信机器人配置
-WECHAT_WEBHOOK_KEY = os.environ.get("WECHAT_WEBHOOK_KEY", "")
-WECHAT_WEBHOOK_URL = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_WEBHOOK_KEY}" if WECHAT_WEBHOOK_KEY else ""
+WECHAT_WEBHOOK = os.environ.get("WECHAT_WEBHOOK", "")
 
 
 # ============================================================
@@ -39,34 +39,42 @@ def now_str():
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 def send_wechat(result, server_id=None, remaining=None):
-    if not WECHAT_WEBHOOK_KEY:
+    if not WECHAT_WEBHOOK:
         print("⚠️ 企业微信未配置，跳过推送")
         return
-
-    content_lines = [
-        f"🎮 Kerit 服务器续期通知",
+    
+    lines = [
+        f"🎮 <font color='info'>Kerit 服务器续期通知</font>",
         f"🕐 运行时间: {now_str()}",
     ]
     if server_id is not None:
-        content_lines.append(f"🖥 服务器ID: {server_id}")
-
-    content_lines.append(f"📊 续期结果: {result}")
+        lines.append(f"🖥 服务器ID: {server_id}")
+    
+    # 根据结果设置颜色
+    if "成功" in result or "✅" in result:
+        color = "info"
+    elif "失败" in result or "❌" in result:
+        color = "warning"
+    else:
+        color = "comment"
+    
+    lines.append(f"📊 续期结果: <font color='{color}'>{result}</font>")
     if remaining is not None:
-        content_lines.append(f"⏱️ 剩余天数: {remaining}天")
-
-    content_text = "\n".join(content_lines)
-
+        lines.append(f"⏱️ 剩余天数: {remaining}天")
+    
+    msg = "\n".join(lines)
+    
     payload = {
-        "msgtype": "text",
-        "text": {
-            "content": content_text
+        "msgtype": "markdown",
+        "markdown": {
+            "content": msg
         }
     }
-
+    
     try:
         data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         req = urllib.request.Request(
-            WECHAT_WEBHOOK_URL,
+            WECHAT_WEBHOOK,
             data=data,
             headers={'Content-Type': 'application/json; charset=utf-8'},
             method="POST"
@@ -156,7 +164,7 @@ def fetch_otp_from_gmail(wait_seconds=60) -> str:
                     else:
                         body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
 
-                    otp = re.search(r'(\d{4})', body)
+                    otp = re.search(r'\b(\d{4})\b', body)
                     if otp:
                         code = otp.group(1)
                         print(f"✅ Gmail OTP: {code}")
@@ -338,79 +346,12 @@ def get_token_value(page) -> str:
 
 
 def turnstile_exists(page) -> bool:
-    """检测页面是否存在待处理的 Turnstile 验证"""
     try:
         return page.evaluate("""() => {
-            (function(){
-                // 方法1: 检测隐藏的 input
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                if (input) return true;
-
-                // 方法2: 检测 Turnstile iframe
-                var iframes = document.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    var src = iframes[i].src || '';
-                    if (src.includes('challenges.cloudflare.com') || src.includes('turnstile')) {
-                        return true;
-                    }
-                }
-
-                // 方法3: 检测 Turnstile 容器 div
-                var containers = document.querySelectorAll('[class*="turnstile"], [class*="cf-"], [id*="turnstile"]');
-                if (containers.length > 0) return true;
-
-                return false;
-            })()
+            (function(){ return document.querySelector('input[name="cf-turnstile-response"]') !== null; })()
         }""")
     except Exception:
         return False
-
-
-def wait_turnstile_complete(page, timeout=60) -> bool:
-    """等待 Turnstile 验证完成（iframe 消失或出现 Success 标记）"""
-    print("⏳ 等待 Turnstile 验证完成...")
-    start = time.time()
-
-    while time.time() - start < timeout:
-        # 检查是否还有 Turnstile 相关元素
-        still_loading = page.evaluate("""() => {
-            (function(){
-                // 如果还有 iframe 或 input，说明还在验证中
-                var input = document.querySelector('input[name="cf-turnstile-response"]');
-                if (input && (!input.value || input.value.length < 20)) return true;
-
-                var iframes = document.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    var src = iframes[i].src || '';
-                    if (src.includes('challenges.cloudflare.com')) {
-                        // 检查 iframe 内容是否显示 Success
-                        try {
-                            var iframeDoc = iframes[i].contentDocument || iframes[i].contentWindow.document;
-                            var bodyText = iframeDoc.body.innerText || '';
-                            if (bodyText.includes('Success') || bodyText.includes('success')) {
-                                return false; // 验证成功
-                            }
-                        } catch(e) {}
-                        return true; // 还在验证
-                    }
-                }
-
-                // 检查是否有成功标记
-                var successMark = document.querySelector('.cf-turnstile-success, [data-cf-turnstile-success]');
-                if (successMark) return false;
-
-                return false; // 没有 Turnstile 元素了，认为已完成
-            })()
-        }""")
-
-        if not still_loading:
-            print("  ✅ Turnstile 验证完成")
-            return True
-
-        time.sleep(1)
-
-    print("  ⚠️ Turnstile 等待超时")
-    return False
 
 
 def solve_turnstile(page) -> bool:
@@ -545,23 +486,16 @@ def do_renew(page):
         time.sleep(2)
 
         print("⏳ 等待Turnstile...")
-        turnstile_found = False
-        for _ in range(30):
+        for _ in range(20):
             if turnstile_exists(page):
                 print("🛡️ 检测到Turnstile")
-                turnstile_found = True
                 break
             time.sleep(1)
-
-        if not turnstile_found:
+        else:
             print("❌ Turnstile未出现")
             page.screenshot(path=f"no_turnstile_{attempt}.png")
             send_wechat(f"❌ Turnstile未出现，第{attempt + 1}次失败", server_id)
             return
-
-        # 等待 Turnstile 完成
-        if not wait_turnstile_complete(page, timeout=60):
-            print("⚠️ Turnstile 完成等待超时，继续尝试...")
 
         if not solve_turnstile(page):
             page.screenshot(path=f"turnstile_fail_{attempt}.png")
@@ -589,7 +523,7 @@ def do_renew(page):
         }}""")
         try:
             res_obj = json.loads(result)
-            if res_obj.get('success') or res_obj == {{}}:
+            if res_obj.get('success') or res_obj == {}:
                 print("✅ 续期成功")
             else:
                 print(f"❌ 续期失败: {result}")
@@ -636,9 +570,9 @@ def main():
     print("=" * 60)
     print("🚀 启动 CloakBrowser + Kerit 邮箱OTP自动登录续期")
     print("=" * 60)
-
+    
     os.environ["CLOAKBROWSER_SUPPRESS_FONT_WARNING"] = "1"
-
+    
     context = launch_persistent_context(
         PROFILE_DIR,
         headless=False,
@@ -654,7 +588,7 @@ def main():
             "--disable-blink-features=AutomationControlled",
         ],
     )
-
+    
     page = context.new_page()
 
     try:
@@ -663,7 +597,7 @@ def main():
         try:
             page.goto("https://api.ipify.org/?format=json", wait_until="domcontentloaded")
             ip_text = page.locator('body').text_content()
-            ip_text = re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'xx', ip_text)
+            ip_text = re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'\1xx', ip_text)
             print(f"✅ 出口IP确认：{ip_text}")
         except Exception:
             print("⚠️ IP验证超时，跳过")
@@ -674,40 +608,18 @@ def main():
         time.sleep(3)
 
         print("🛡️ 检查Cloudflare...")
-
-        # 阶段1: 等待 Turnstile 出现（如果存在的话）
-        turnstile_appeared = False
-        for _ in range(30):
-            time.sleep(1)
+        for _ in range(20):
+            time.sleep(0.5)
             if turnstile_exists(page):
-                print("🛡️ 检测到Turnstile，开始解决...")
-                turnstile_appeared = True
+                print("🛡️ 检测到Turnstile...")
                 if not solve_turnstile(page):
                     page.screenshot(path="kerit_cf_fail.png")
                     send_wechat("❌ 登录页Turnstile验证失败")
                     return
+                time.sleep(2)
                 break
-
-        # 阶段2: 无论是否检测到 Turnstile，都等待验证完全完成
-        # 因为有时 Turnstile 是隐式的，页面需要等待 Cloudflare 放行
-        print("⏳ 等待页面完全加载...")
-        if turnstile_appeared:
-            # 如果检测到了 Turnstile，额外等待它完成
-            if not wait_turnstile_complete(page, timeout=60):
-                print("⚠️ Turnstile 可能已完成或不存在")
         else:
-            print("✅ 未检测到显式Turnstile")
-
-        # 阶段3: 等待网络稳定，确保按钮可交互
-        try:
-            page.wait_for_load_state('networkidle', timeout=15000)
-        except Exception:
-            pass
-        time.sleep(2)
-
-        # 调试截图
-        page.screenshot(path="debug_cf_ready.png")
-        print("  📸 已保存Cloudflare就绪截图: debug_cf_ready.png")
+            print("✅ 无Turnstile，继续")
 
         print("📭 等待邮箱框...")
         try:
@@ -722,70 +634,32 @@ def main():
         print(f"✅ 邮箱：{MASKED_EMAIL}")
 
         print("🖱️ 点击继续...")
-
-        # 先触发 blur 确保按钮状态更新
-        page.evaluate("""() => { document.activeElement?.blur(); }""")
-        time.sleep(0.5)
-
         clicked = False
-
-        # 方法1: Playwright 选择器
         for selector in [
             'button:has-text("Continue with Email")',
             'a:has-text("Continue with Email")',
             'button[type="submit"]',
-            '[type="submit"]',
-            'button:has-text("Continue")',
-            'a:has-text("Continue")',
         ]:
             try:
-                el = page.locator(selector).first
-                if el.is_visible(timeout=2000):
-                    el.scroll_into_view_if_needed()
-                    time.sleep(0.3)
-                    el.click(force=True, timeout=10000)
-                    print(f"  ✅ 通过选择器点击: {selector}")
+                if page.locator(selector).count() > 0:
+                    page.click(selector, timeout=10000)
                     clicked = True
                     break
-            except Exception as e:
-                print(f"  ⏭️ 选择器跳过 {selector}: {str(e)[:60]}")
+            except Exception:
                 continue
 
-        # 方法2: JS 兜底 - 更全面的匹配
         if not clicked:
-            print("  📟 尝试 JS 兜底点击...")
             result = page.evaluate("""() => {
-                const allEls = Array.from(document.querySelectorAll('button, a, input[type="submit"], [role="button"]'));
-                const candidates = [];
-
-                for (const el of allEls) {
-                    const txt = (el.textContent || el.value || '').toLowerCase().trim();
-                    candidates.push(txt.substring(0, 50));
-
-                    // 多种匹配策略
-                    if (txt.includes('continue with email') || 
-                        txt === 'continue' ||
-                        txt === 'submit' ||
-                        txt.includes('send') ||
-                        (el.type === 'submit' && txt === '')) {
-
-                        // 模拟真实点击
-                        el.focus();
-                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-                        el.click();
-
-                        return {
-                            found: true, 
-                            text: el.textContent?.trim() || el.value || 'no-text',
-                            tag: el.tagName,
-                            className: el.className
-                        };
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const btn of buttons) {
+                    if (btn.textContent.toLowerCase().includes('continue with email') || 
+                        btn.textContent.toLowerCase().includes('continue')) {
+                        btn.click();
+                        return {found: true, text: btn.textContent.trim()};
                     }
                 }
-                return {found: false, candidates: candidates.slice(0, 15)};
+                return {found: false};
             }""")
-            print(f"  JS 结果: {result}")
             clicked = result.get("found", False)
 
         if not clicked:
@@ -795,14 +669,6 @@ def main():
             return
 
         print("📨 等待OTP框...")
-        # 先等待网络稳定
-        time.sleep(2)
-        page.wait_for_load_state('networkidle', timeout=15000)
-
-        # 调试截图
-        page.screenshot(path="debug_after_click_continue.png")
-        print("  📸 已保存点击后继续页面截图: debug_after_click_continue.png")
-
         try:
             page.wait_for_selector('.otp-input', state='visible', timeout=30000)
         except Exception:
@@ -847,44 +713,31 @@ def main():
 
         print("🚀 点击验证...")
         verify_clicked = False
-
         for selector in [
             'button:has-text("Verify Code")',
             'a:has-text("Verify Code")',
             'button[type="submit"]',
-            '[type="submit"]',
-            'button:has-text("Verify")',
-            'a:has-text("Verify")',
         ]:
             try:
-                el = page.locator(selector).first
-                if el.is_visible(timeout=2000):
-                    el.scroll_into_view_if_needed()
-                    time.sleep(0.3)
-                    el.click(force=True, timeout=10000)
-                    print(f"  ✅ 通过选择器点击: {selector}")
+                if page.locator(selector).count() > 0:
+                    page.click(selector, timeout=10000)
                     verify_clicked = True
                     break
             except Exception:
                 continue
 
         if not verify_clicked:
-            print("  📟 尝试 JS 兜底点击...")
             result = page.evaluate("""() => {
-                const allEls = Array.from(document.querySelectorAll('button, a, input[type="submit"], [role="button"]'));
-                for (const el of allEls) {
-                    const txt = (el.textContent || el.value || '').toLowerCase().trim();
-                    if (txt.includes('verify') || txt.includes('verify code') || txt === 'submit') {
-                        el.focus();
-                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-                        el.click();
-                        return {found: true, text: el.textContent?.trim() || el.value || 'no-text', tag: el.tagName};
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const btn of buttons) {
+                    if (btn.textContent.toLowerCase().includes('verify') || 
+                        btn.textContent.toLowerCase().includes('verify code')) {
+                        btn.click();
+                        return {found: true, text: btn.textContent.trim()};
                     }
                 }
                 return {found: false};
             }""")
-            print(f"  JS 结果: {result}")
             verify_clicked = result.get("found", False)
 
         if not verify_clicked:
@@ -917,7 +770,7 @@ def main():
         print("\n" + "=" * 60)
         print("🎉 任务完成！会话已保存至 kerit_auth.json")
         print("=" * 60)
-
+        
     except Exception as e:
         print(f"\n❌ 自动化链条断裂: {str(e)}")
         try:
