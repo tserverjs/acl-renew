@@ -62,7 +62,6 @@ def send_wechat(result, server_id=None, remaining=None):
     if remaining is not None:
         lines.append(f"⏱️ 剩余天数: {remaining}天")
     
-    # ✅ 修正点：确保此行不换行，直接拼接
     msg = "\n".join(lines)
     
     payload = {
@@ -587,7 +586,7 @@ def main():
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
-            "--start-maximized",  # ✅ 增加最大化参数，保证 xdotool 坐标映射更稳定
+            "--start-maximized",
         ],
     )
     
@@ -638,55 +637,69 @@ def main():
         print("🖱️ 点击继续...")
         clicked = False
 
-        # 先等待按钮可点击
-        page.wait_for_load_state('networkidle', timeout=15000)
-        time.sleep(1)
+        # ✅ 移除不稳定的 networkidle 检查，改用 domcontentloaded
+        try:
+            page.wait_for_load_state('domcontentloaded', timeout=5000)
+        except Exception:
+            pass
 
+        # 1. 显式等待按钮在 DOM 中可用并可见
+        try:
+            page.wait_for_selector('button:has-text("Continue with Email"), button[type="submit"]', state='visible', timeout=10000)
+        except Exception:
+            print("⚠️ 没等到预期的按钮选择器，尝试直接强点...")
+
+        # 2. 方案 A：通过选择器穿透强制点击
         for selector in [
             'button:has-text("Continue with Email")',
-            'a:has-text("Continue with Email")',
             'button[type="submit"]',
+            'form button',
         ]:
             try:
-                if page.locator(selector).count() > 0:
-                    page.locator(selector).first.click(timeout=10000)
+                btn = page.locator(selector).first
+                if btn.count() > 0:
+                    btn.click(timeout=5000, force=True)
                     clicked = True
-                    print(f"✅ 通过选择器点击成功: {selector}")
+                    print(f"✅ 通过选择器强行点击成功: {selector}")
                     break
-            except Exception as e:
-                print(f"  选择器 {selector} 失败: {e}")
+            except Exception:
                 continue
 
+        # 3. 方案 B：如果选择器点击失败，启动全自动化强刷 JS 全鼠标事件流穿透点击
         if not clicked:
-            # 使用 JavaScript 点击
+            print("🔄 常规点击未生效，启动 JS 强力穿透点击...")
             result = page.evaluate("""() => {
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                for (const btn of buttons) {
-                    const text = btn.textContent.trim().toLowerCase();
-                    if (text.includes('continue with email') || text === 'continue') {
-                        btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                        btn.click();
-                        return {found: true, text: btn.textContent.trim()};
+                const elements = Array.from(document.querySelectorAll('button, a'));
+                for (const el of elements) {
+                    const text = el.textContent.trim().toLowerCase();
+                    if (text.includes('continue')) {
+                        el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        ['mousedown', 'mouseup', 'click'].forEach(eventType => {
+                            const evt = new MouseEvent(eventType, {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window
+                            });
+                            el.dispatchEvent(evt);
+                        });
+                        return {found: true, text: el.textContent.trim()};
                     }
                 }
                 return {found: false};
             }""")
             clicked = result.get("found", False)
             if clicked:
-                print(f"✅ 通过JS点击成功: {result.get('text')}")
+                print(f"✅ 通过强力 JS 事件流点击成功: {result.get('text')}")
 
         if not clicked:
-            print("❌ 继续按钮缺失")
+            print("❌ 继续按钮点击失败")
             page.screenshot(path="kerit_no_continue_btn.png")
-            send_wechat("❌ 继续按钮缺失")
+            send_wechat("❌ 继续按钮点击失败")
             return
 
         print("⏳ 等待页面跳转/OTP框出现...")
-        try:
-            page.wait_for_load_state('networkidle', timeout=15000)
-        except Exception:
-            pass
-        time.sleep(2)
+        # ✅ 同样将此处的 networkidle 转换为更稳固的固定延迟
+        time.sleep(3)
 
         # 截图查看当前状态
         page.screenshot(path="kerit_after_click.png")
