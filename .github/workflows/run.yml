@@ -1,0 +1,99 @@
+name: Kerit Cloud Login with CloakBrowser
+
+on:
+  workflow_dispatch: # 支持手动点击运行
+  schedule:
+    - cron: '0 8 * * *' # 每天早上 8 点自动挂机运行
+
+jobs:
+  run-stealth-login:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' # 保持你项目标准的 Python 3.11 环境
+
+    - name: 📦 安装系统底层依赖
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          xvfb curl wget wmctrl ffmpeg scrot \
+          fonts-noto-color-emoji xdotool \
+          x11-utils x11-xserver-utils
+
+    - name: 🌐 启动GOST代理
+      env:
+        GOST_PROXY: ${{ secrets.GOST_PROXY }}
+      run: |
+        VERSION=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+        wget -q "https://github.com/go-gost/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
+        tar -xzf gost_${VERSION}_linux_amd64.tar.gz
+        chmod +x ./gost
+        nohup ./gost -L socks5://:40000 -F "${GOST_PROXY}" > gost-proxy.log 2>&1 &
+        sleep 6
+        EXIT_IP=$(curl -s --max-time 6 --proxy socks5://127.0.0.1:40000 https://api.ipify.org || true)
+        if [ -z "${EXIT_IP}" ]; then
+          echo "❌ 代理隧道连接失败"
+          cat gost-proxy.log
+          exit 1
+        fi
+        MASK_IP=$(echo ${EXIT_IP} | sed 's/\([0-9]*\)\..*/\1.*.*/')
+        echo "✅ 代理就绪，出口IP段: ${MASK_IP}"
+
+    - name: Install Python Dependencies
+      run: |
+        pip install cloakbrowser
+
+    - name: 🎬 开启虚拟桌面与视频录制监控
+      env:
+        DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      run: |
+        # 1. 启动 Xvfb 虚拟屏幕 (DISPLAY :99)并设置 1920x1080
+        Xvfb :99 -ac -screen 0 1920x1080x24 > /dev/null 2>&1 &
+        export DISPLAY=:99
+        sleep 2
+        
+        # 2. 启动 ffmpeg 对虚拟显示器进行全屏录像
+        echo "🎥 正在初始化屏幕录像机..."
+        ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 -codec:v libx264 -pix_fmt yuv420p cloak_run_record.mp4 > ffmpeg.log 2>&1 &
+        FFMPEG_PID=$!
+        sleep 2
+
+        # 🌟 守护进程：一旦检测到有 CloakBrowser/Chromium 窗口弹出，立刻通过 wmctrl 强行进行物理全屏最大化
+        (
+          for i in {1..10}; do
+            sleep 2
+            if wmctrl -l | grep -iE "chrome|chromium|cloak|kerit" > /dev/null; then
+              echo "🎯 检测到浏览器窗口，正在通过 wmctrl 执行物理全屏最大化..."
+              wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz || true
+              break
+            fi
+          done
+        ) &
+
+        # 3. 执行核心自动化登录脚本
+        echo "🚀 开始运行 CloakBrowser 自动化脚本..."
+        python cloak_discord.py || touch .script_failed
+
+        # 4. 优雅停止录像
+        echo "🛑 脚本运行完毕，正在保存录像..."
+        kill -SIGINT $FFMPEG_PID
+        sleep 3
+
+        # 如果 Python 脚本异常退出，标记整个工作流为失败
+        if [ -f .script_failed ]; then
+          echo "❌ 脚本执行遭遇异常，请检查下载的录像。"
+          exit 1
+        fi
+
+    - name: 📦 上传操作录像视频
+      if: always() # 无论成功还是失败，都强制上传录像供排查
+      uses: actions/upload-artifact@v4
+      with:
+        name: execution-video-record
+        path: cloak_run_record.mp4
+        retention-days: 7
