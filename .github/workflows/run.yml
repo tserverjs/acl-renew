@@ -1,10 +1,10 @@
 # ============================================
-# ACL Cloud 自动续期工作流（全流程录屏版）
-# 功能：自动登录、双验证码处理、FFmpeg全程录屏
+# ACL Cloud 自动登录 + 续期工作流（全功能完整版）
+# 功能：自动登录、验证码处理、续期弹窗验证、FFmpeg全程录屏、全步骤截图
 # 触发方式：定时任务 + 手动触发
 # ============================================
 
-name: 🔐 ACL Cloud 自动续期（全流程录屏）
+name: 🔐 ACL Cloud 自动续期（全功能完整版）
 
 on:
   schedule:
@@ -25,7 +25,7 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  RECORDING_FILE: operation_recording.mp4
+  DISPLAY: ':99'
 
 permissions:
   contents: read
@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   login-and-renew:
-    name: 🚀 自动登录并续期（全程录屏）
+    name: 🚀 自动登录续期+全程录屏
     runs-on: ubuntu-latest
     timeout-minutes: 20
     
@@ -49,7 +49,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       
-      - name: 📦 安装系统依赖（含FFmpeg和虚拟桌面）
+      - name: 📦 安装系统全依赖
         run: |
           echo "🔧 正在安装系统依赖..."
           sudo apt-get update -qq
@@ -80,11 +80,85 @@ jobs:
           echo "  - Tesseract 版本：$(tesseract --version | head -1)"
           echo "  - FFmpeg 版本：$(ffmpeg -version | head -1)"
       
-      - name: 🎥 启动虚拟桌面 + FFmpeg 全程录屏
+      - name: 🎬 启动虚拟桌面 + FFmpeg 全程录屏
+        run: |
+          echo "🖥️ 启动虚拟显示服务..."
+          Xvfb $DISPLAY -screen 0 1920x1080x24 &
+          sleep 2
+          
+          echo "🎥 启动 FFmpeg 后台录屏..."
+          ffmpeg -f x11grab -video_size 1920x1080 -i $DISPLAY -r 15 -c:v libx264 -preset ultrafast -y operation_recording.mp4 &
+          echo $! > ffmpeg_pid.txt
+          echo "✅ 录屏已启动"
+      
+      - name: 🏃 执行登录和续期脚本
         id: automation
         env:
           ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           ACL_LOGIN_URL: ${{ secrets.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
         run: |
-          echo "⏰ 开始时间：$(date '+
+          echo "⏰ 开始时间：$(date '+%Y-%m-%d %H:%M:%S')"
+          echo "🔑 正在执行自动登录和续期..."
+          
+          if python acl_renew.py; then
+            echo "✅ 操作成功完成！"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ 操作失败！"
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 🛑 停止 FFmpeg 录屏
+        if: always()
+        run: |
+          echo "🛑 停止录屏进程..."
+          kill $(cat ffmpeg_pid.txt) || true
+          sleep 3
+          echo "✅ 录屏已保存为 operation_recording.mp4"
+      
+      - name: 📸 上传全步骤截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-screenshots-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: 🎥 上传全程操作录屏
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-operation-recording-${{ github.run_id }}
+          path: operation_recording.mp4
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: 📬 输出操作结果
+        if: always()
+        run: |
+          STATUS="${{ steps.automation.outputs.status }}"
+          TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+          
+          echo "================================"
+          echo "   ACL Cloud 自动续期报告"
+          echo "================================"
+          echo ""
+          echo "📅 运行时间：$TIME"
+          echo "🆔 运行编号：${{ github.run_id }}"
+          echo "📊 操作状态：$STATUS"
+          echo ""
+          
+          if [ "$STATUS" == "success" ]; then
+            echo "🎉 自动续期成功！"
+            echo "📸 全步骤截图已上传到 Artifacts"
+            echo "🎥 全程操作录屏已上传到 Artifacts"
+          else
+            echo "❌ 自动续期失败，请检查截图和录屏排查问题。"
+            echo "📸 全步骤截图已上传到 Artifacts"
+            echo "🎥 全程操作录屏已上传到 Artifacts"
+          fi
+          echo ""
+          echo "================================"
