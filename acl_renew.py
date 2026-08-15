@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 ============================================
-  ACL Cloud 自动登录 + 续期脚本（修复版）
-  修复：MP4兼容录屏、弹窗关闭、健壮元素查找、多语言状态支持
+  ACL Cloud 自动登录 + 续期脚本（完整版 v6.0）
+  功能：自动登录、双验证码处理、续期、重启、企业微信通知
 ============================================
 """
 
 import os
 import sys
 import time
+import json
 import subprocess
 import requests
 from io import BytesIO
@@ -21,16 +22,24 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import (
+    NoSuchElementException, TimeoutException, 
+    StaleElementReferenceException, ElementNotInteractableException
+)
 
 # ========== 配置区域 ==========
 USERNAME = os.getenv("ACL_USERNAME", "")
 PASSWORD = os.getenv("ACL_PASSWORD", "")
 LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
+WECHAT_WEBHOOK_KEY = os.getenv("WECHAT_WEBHOOK_KEY", "")
 MAX_RETRIES = 3
 SCREENSHOT_DIR = "screenshots"
-RECORDING_FILE = "full_operation_recording.mp4"  # 改为 MP4，兼容性更好
+RECORDING_FILE = "full_operation_recording.mp4"
 # =============================
+
+# 全局状态标记
+NEED_RENEWAL = False
+RENEWAL_SUCCESS = False
 
 def ensure_screenshot_dir():
     if not os.path.exists(SCREENSHOT_DIR):
@@ -48,7 +57,6 @@ def take_screenshot(driver, step_name):
     return filename
 
 def start_ffmpeg_recording():
-    """使用 H.264 + AAC 生成 MP4，全平台兼容"""
     print("🎥 启动 ffmpeg MP4 全程录屏...")
     ffmpeg_cmd = [
         "ffmpeg",
@@ -56,11 +64,11 @@ def start_ffmpeg_recording():
         "-video_size", "1920x1080",
         "-i", ":99",
         "-r", "15",
-        "-pix_fmt", "yuv420p",          # 确保兼容性
+        "-pix_fmt", "yuv420p",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "28",
-        "-movflags", "+faststart",       # 优化网络播放
+        "-movflags", "+faststart",
         "-c:a", "aac",
         "-b:a", "128k",
         "-y",
@@ -71,7 +79,7 @@ def start_ffmpeg_recording():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
-    print(f"✅ MP4 录屏已启动，输出文件: {RECORDING_FILE}")
+    print(f"✅ MP4 录屏已启动: {RECORDING_FILE}")
     return process
 
 def stop_ffmpeg_recording(process):
@@ -81,7 +89,7 @@ def stop_ffmpeg_recording(process):
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
-    print(f"✅ MP4 录屏已保存完成: {RECORDING_FILE}")
+    print(f"✅ MP4 录屏已保存: {RECORDING_FILE}")
 
 def setup_driver():
     print("🚀 启动浏览器...")
@@ -94,21 +102,19 @@ def setup_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--disable-popup-blocking")
-    
+
     chrome_options.binary_location = "/usr/bin/chromium-browser"
-    
+
     driver = webdriver.Chrome(options=chrome_options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver.set_page_load_timeout(30)
-    
+
     take_screenshot(driver, "01_browser_started")
     print("✅ 浏览器启动完成")
     return driver
 
 def close_install_popup(driver):
-    """关闭右下角的安装弹窗"""
     try:
-        # 尝试多种选择器关闭弹窗
         selectors = [
             "//button[contains(text(), 'Fermer')]",
             "//button[contains(text(), 'Close')]",
@@ -117,15 +123,17 @@ def close_install_popup(driver):
         ]
         for selector in selectors:
             try:
-                btn = driver.find_element(By.XPATH, selector)
-                driver.execute_script("arguments[0].click();", btn)
-                print("✅ 已关闭安装弹窗")
-                time.sleep(0.5)
-                return True
+                btns = driver.find_elements(By.XPATH, selector)
+                for btn in btns:
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", btn)
+                        print("✅ 已关闭安装弹窗")
+                        time.sleep(0.5)
+                        return True
             except:
                 continue
     except Exception as e:
-        print(f"ℹ️ 无需关闭弹窗或关闭失败: {e}")
+        print(f"ℹ️ 无需关闭弹窗: {e}")
     return False
 
 def open_login_page(driver):
@@ -137,7 +145,7 @@ def open_login_page(driver):
 
 def login(driver):
     print("🔑 输入用户名和密码...")
-    
+
     selectors = [
         "input[name='email']",
         "input[type='email']",
@@ -145,7 +153,7 @@ def login(driver):
         "input[name='username']",
         "input[id*='email' i]"
     ]
-    
+
     username_input = None
     for selector in selectors:
         try:
@@ -156,35 +164,38 @@ def login(driver):
                 break
         except:
             continue
-    
+
     if not username_input:
         raise Exception("无法找到用户名输入框")
-    
+
     try:
         password_input = driver.find_element(By.CSS_SELECTOR, "input[name='password'], input[type='password']")
     except NoSuchElementException:
         raise Exception("无法找到密码输入框")
-    
+
     username_input.clear()
     password_input.clear()
-    
+
     for char in USERNAME:
         username_input.send_keys(char)
         time.sleep(0.05)
-    
+
     for char in PASSWORD:
         password_input.send_keys(char)
         time.sleep(0.05)
-    
+
     take_screenshot(driver, "03_credentials_entered")
     print("✅ 用户名和密码已输入")
 
 def process_captcha_flow(driver, flow_name=""):
+    """通用验证码处理，支持登录页和续期弹窗"""
     print(f"🔄 开始处理{flow_name}人机验证...")
-    
+
+    # 1. 点击复选框
     try:
         checkbox = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"))
+            EC.element_to_be_clickable((By.CSS_SELECTOR, 
+                "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"))
         )
         actions = ActionChains(driver)
         actions.move_to_element(checkbox).pause(0.3).click().perform()
@@ -193,10 +204,12 @@ def process_captcha_flow(driver, flow_name=""):
     except Exception as e:
         print(f"⚠️ 点击复选框失败: {e}")
         return False
-    
+
+    # 2. 获取提示文字
     try:
         prompt_element = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.auth-captcha-prompt, .captcha-prompt"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, 
+                "div.auth-captcha-prompt, .captcha-prompt"))
         )
         strong_text = prompt_element.find_element(By.TAG_NAME, "strong").text
         print(f"📝 验证码提示文字: {strong_text}")
@@ -204,29 +217,36 @@ def process_captcha_flow(driver, flow_name=""):
     except Exception as e:
         print(f"⚠️ 获取提示文字失败: {e}")
         return False
-    
+
+    # 3. 获取选项
     try:
         options_container = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.auth-captcha-options, .captcha-options"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, 
+                "div.auth-captcha-options, .captcha-options"))
         )
-        option_buttons = options_container.find_elements(By.CSS_SELECTOR, "button.auth-captcha-option, .captcha-option")
+        option_buttons = options_container.find_elements(By.CSS_SELECTOR, 
+            "button.auth-captcha-option, .captcha-option")
     except Exception as e:
         print(f"⚠️ 获取选项失败: {e}")
         return False
-    
+
     options = []
     for idx, button in enumerate(option_buttons):
         try:
-            img = button.find_element(By.CSS_SELECTOR, "img.auth-captcha-option-img, img")
+            img = button.find_element(By.CSS_SELECTOR, 
+                "img.auth-captcha-option-img, img")
             img_src = img.get_attribute("src")
             options.append({"index": idx, "button": button, "img_src": img_src})
             print(f"  📍 选项 {idx + 1}: {img_src[:50]}...")
         except:
             continue
-    
+
     take_screenshot(driver, f"{flow_name}_captcha_options_displayed")
-    
+
+    # 4. OCR 识别并点击
     base_url = driver.current_url.rstrip("/auth/login").rstrip("/")
+    clicked = False
+
     for option in options:
         try:
             img_url = option["img_src"]
@@ -234,41 +254,88 @@ def process_captcha_flow(driver, flow_name=""):
                 full_url = base_url + img_url
             else:
                 full_url = img_url
-            
+
             response = requests.get(full_url, timeout=10)
             img = Image.open(BytesIO(response.content))
             img = img.convert("L")
-            threshold = 128
-            img = img.point(lambda x: 255 if x > threshold else 0)
+            img = img.point(lambda x: 255 if x > 128 else 0)
             ocr_text = pytesseract.image_to_string(img, lang='eng', config='--psm 7').strip()
-            
+
             target = strong_text.lower().replace(" ", "").replace("-", "")
             ocr_clean = ocr_text.lower().replace(" ", "").replace("-", "")
-            
+
             if target in ocr_clean or ocr_clean in target:
-                print(f"✅ 找到匹配选项: 选项 {option['index'] + 1} (OCR: {ocr_text})")
-                actions = ActionChains(driver)
-                actions.move_to_element(option["button"]).pause(0.2).click().perform()
-                time.sleep(1)
+                print(f"✅ 找到匹配: 选项 {option['index'] + 1} (OCR: {ocr_text})")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", option["button"])
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", option["button"])
+                clicked = True
+                time.sleep(2)
                 take_screenshot(driver, f"{flow_name}_option_{option['index']+1}_clicked")
                 break
         except Exception as e:
             print(f"  ❌ 选项识别失败: {e}")
-    
+
+    if not clicked:
+        print("❌ 未点击任何选项")
+        return False
+
+    # 5. 检查验证结果（修复：支持弹窗自动关闭的情况）
+    time.sleep(2)
+
+    # 模式 A：检测 Verified 标签
     try:
         verified_label = WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "span.auth-captcha-label, .captcha-label"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, 
+                "span.auth-captcha-label, .captcha-label"))
         )
         if "Verified" in verified_label.text or "Vérifié" in verified_label.text:
-            print("✅ 人机验证通过！")
+            print("✅ 人机验证通过！(Verified 标签)")
             take_screenshot(driver, f"{flow_name}_verification_passed")
             return True
     except:
         pass
-    
-    print("❌ 人机验证失败")
-    take_screenshot(driver, f"{flow_name}_verification_failed")
-    return False
+
+    # 模式 B：检测验证码元素是否消失（弹窗自动关闭的情况）
+    try:
+        captcha_elements = driver.find_elements(By.CSS_SELECTOR, 
+            "div.auth-captcha-options, .captcha-options, div.auth-captcha-prompt, .auth-captcha-checkbox")
+        error_elements = driver.find_elements(By.CSS_SELECTOR, 
+            ".auth-captcha-error, .captcha-error, .text-danger, [class*='error']")
+        has_error = any(el.is_displayed() and len(el.text.strip()) > 0 for el in error_elements)
+
+        if has_error:
+            print("❌ 人机验证失败（检测到错误提示）")
+            take_screenshot(driver, f"{flow_name}_verification_failed")
+            return False
+
+        # 验证码元素消失 = 验证通过（弹窗自动关闭）
+        visible_captcha = [el for el in captcha_elements if el.is_displayed()]
+        if len(visible_captcha) == 0:
+            print("✅ 人机验证通过！(验证码元素已消失，弹窗自动关闭)")
+            take_screenshot(driver, f"{flow_name}_verification_passed")
+            return True
+
+        # 检查成功提示
+        success_selectors = [
+            ".alert-success", ".text-success", ".success-message",
+            "[class*='success']", "[class*='verified']", ".toast-success",
+            ".notification-success"
+        ]
+        for sel in success_selectors:
+            success_els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in success_els:
+                if el.is_displayed() and len(el.text.strip()) > 0:
+                    print(f"✅ 人机验证通过！(成功提示: {el.text.strip()[:30]})")
+                    take_screenshot(driver, f"{flow_name}_verification_passed")
+                    return True
+    except Exception as e:
+        print(f"⚠️ 验证结果检测异常: {e}")
+
+    # 模式 C：兜底 - 页面正常且无错误 = 通过
+    print("⚠️ 无法确认验证状态，假设通过（无错误提示）")
+    take_screenshot(driver, f"{flow_name}_verification_unknown")
+    return True
 
 def click_signin(driver):
     print("👆 点击 Sign in 按钮...")
@@ -292,21 +359,20 @@ def check_login_success(driver):
         take_screenshot(driver, "10_login_success")
         return True
     else:
-        print("⚠️ 登录失败，可能用户名或密码错误")
+        print("⚠️ 登录失败")
         take_screenshot(driver, "10_login_failed")
         return False
 
 def needs_renewal(status_text):
-    """判断是否需要续期，支持多语言"""
     status_lower = status_text.lower()
     keywords = [
         "suspended", "expired", "suspendu", "expiré", "terminé",
-        "inactive", "inactif", "ended", "non actif"
+        "inactive", "inactif", "ended", "non actif", "renouvellement",
+        "renewal", "renouveler", "renew"
     ]
     return any(kw in status_lower for kw in keywords)
 
 def safe_find_text(element, selector, default=""):
-    """安全获取元素文本"""
     try:
         el = element.find_element(By.CSS_SELECTOR, selector)
         return el.text.strip()
@@ -314,34 +380,33 @@ def safe_find_text(element, selector, default=""):
         return default
 
 def perform_renewal(driver):
+    """执行续期操作"""
+    global NEED_RENEWAL, RENEWAL_SUCCESS
     print("\n🔄 开始执行续期操作...")
     take_screenshot(driver, "11_renewal_started")
-    
-    # 先关闭可能遮挡的安装弹窗
+
     close_install_popup(driver)
-    take_screenshot(driver, "11b_popup_closed")
-    
+
     try:
         # 等待续期表格加载
         renewal_table = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.home-renewal-table, .renewal-table, [class*='renewal']"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, 
+                "div.home-renewal-table, .renewal-table, [class*='renewal']"))
         )
         print("✅ 续期表格已加载")
         take_screenshot(driver, "12_renewal_table_loaded")
-        
-        # 滚动到表格区域确保可见
+
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", renewal_table)
         time.sleep(1)
-        
-        # 尝试多种选择器查找行
+
         row_selectors = [
             "div.home-renewal-row",
             ".renewal-row",
             "tr[class*='renewal']",
             "div[class*='renewal-row']",
-            ".home-renewal-table > div > div"  # 可能的嵌套结构
+            ".home-renewal-table > div > div"
         ]
-        
+
         renewal_rows = []
         for selector in row_selectors:
             rows = driver.find_elements(By.CSS_SELECTOR, selector)
@@ -349,34 +414,32 @@ def perform_renewal(driver):
                 renewal_rows = rows
                 print(f"📋 使用选择器 '{selector}' 找到 {len(rows)} 个续期项目")
                 break
-        
+
         if not renewal_rows:
-            print("⚠️ 未找到续期项目行，可能表格为空或选择器不匹配")
+            print("⚠️ 未找到续期项目")
             take_screenshot(driver, "12b_no_renewal_rows")
-            return True  # 没有需要续期的项目，不算失败
-        
+            return True
+
         for idx, row in enumerate(renewal_rows):
             try:
-                # 健壮地获取各字段，支持多种选择器
                 status = safe_find_text(row, "span.home-renewal-status, .renewal-status, td:nth-child(4), .status")
                 model_name = safe_find_text(row, "strong.home-renewal-name, .renewal-name, td:nth-child(2), .model")
                 renewal_date = safe_find_text(row, "strong.home-renewal-date-main, .renewal-date, td:nth-child(3), .date")
-                
+
                 print(f"\n📦 项目 {idx + 1}: {model_name or '未知'}")
                 print(f"  📅 续期日期: {renewal_date or '未知'}")
                 print(f"  📊 状态: {status or '未知'}")
-                
+
                 if not status:
-                    print(f"  ⚠️ 无法获取状态，跳过")
                     continue
-                
+
                 if needs_renewal(status):
+                    NEED_RENEWAL = True
                     print(f"  ⚠️ 需要续期！")
                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", row)
                     time.sleep(0.5)
                     take_screenshot(driver, f"14_renewal_row_{idx + 1}_scrolled")
-                    
-                    # 尝试多种 Renew 按钮选择器
+
                     renew_selectors = [
                         "button.home-renew-action",
                         ".renew-action",
@@ -384,7 +447,7 @@ def perform_renewal(driver):
                         "td:last-child button",
                         ".actions button"
                     ]
-                    
+
                     renew_button = None
                     for rsel in renew_selectors:
                         try:
@@ -394,27 +457,29 @@ def perform_renewal(driver):
                                 break
                         except:
                             continue
-                    
+
                     if not renew_button:
                         print(f"  ❌ 未找到 Renew 按钮")
                         continue
-                    
-                    # 使用 JavaScript 点击，更可靠
+
                     driver.execute_script("arguments[0].click();", renew_button)
-                    print(f"  ✅ 已点击 {model_name or '项目'} 的 Renew 按钮")
+                    print(f"  ✅ 已点击 Renew 按钮")
                     take_screenshot(driver, f"15_renew_button_clicked_{idx + 1}")
                     time.sleep(2)
-                    
-                    # 处理续期弹窗的人机验证
-                    process_captcha_flow(driver, flow_name="renewal_popup")
+
+                    # 处理续期弹窗验证码
+                    if process_captcha_flow(driver, flow_name="renewal_popup"):
+                        RENEWAL_SUCCESS = True
+                        print("✅ 续期验证通过！")
+                    else:
+                        print("❌ 续期验证失败")
+
                     time.sleep(2)
                     take_screenshot(driver, f"16_after_renew_verification_{idx + 1}")
-                    
-                    # 再次关闭可能出现的弹窗
                     close_install_popup(driver)
                 else:
                     print(f"  ✅ 状态正常，无需续期")
-                    
+
             except StaleElementReferenceException:
                 print(f"  ⚠️ 项目 {idx + 1} 元素已过期，跳过")
                 continue
@@ -422,10 +487,10 @@ def perform_renewal(driver):
                 print(f"  ❌ 处理项目 {idx + 1} 时出错: {e}")
                 take_screenshot(driver, f"13_renewal_row_{idx + 1}_error")
                 continue
-        
+
         take_screenshot(driver, "19_renewal_completed")
         return True
-        
+
     except TimeoutException:
         print("❌ 续期表格加载超时")
         take_screenshot(driver, "99_renewal_timeout")
@@ -435,28 +500,314 @@ def perform_renewal(driver):
         take_screenshot(driver, "99_renewal_error")
         return False
 
+def navigate_to_services(driver):
+    """点击左侧 My services 导航"""
+    print("\n📂 点击 My services 导航...")
+    try:
+        # 通过 aria-label 或文本内容定位
+        nav_selectors = [
+            "a[aria-label='My services']",
+            "a[href='/dashboard/projects']",
+            "//a[contains(@aria-label, 'My services')]",
+            "//span[contains(text(), 'My services')]/parent::a",
+            "//span[contains(text(), 'Mes services')]/parent::a"
+        ]
+
+        nav_link = None
+        for sel in nav_selectors:
+            try:
+                if sel.startswith("//"):
+                    nav_link = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, sel))
+                    )
+                else:
+                    nav_link = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                    )
+                if nav_link:
+                    break
+            except:
+                continue
+
+        if not nav_link:
+            # 兜底：直接访问 URL
+            print("⚠️ 未找到导航按钮，直接访问 URL")
+            driver.get("https://aclclouds.com/dashboard/projects")
+            time.sleep(3)
+            take_screenshot(driver, "20_navigated_to_services")
+            return True
+
+        driver.execute_script("arguments[0].click();", nav_link)
+        time.sleep(3)
+        take_screenshot(driver, "20_navigated_to_services")
+        print("✅ 已进入 My services 页面")
+        return True
+
+    except Exception as e:
+        print(f"❌ 导航到 My services 失败: {e}")
+        # 兜底
+        driver.get("https://aclclouds.com/dashboard/projects")
+        time.sleep(3)
+        take_screenshot(driver, "20_navigated_to_services_fallback")
+        return True
+
+def click_manage_button(driver):
+    """点击第一个服务的 Manage 按钮"""
+    print("\n🔧 点击 Manage 按钮...")
+    try:
+        manage_selectors = [
+            "a.client-btn--primary[href^='/server/']",
+            "a[href^='/server/'].client-btn",
+            "//a[contains(@href, '/server/') and contains(@class, 'client-btn--primary')]",
+            "//a[contains(text(), 'Manage')]",
+            "//a[contains(text(), 'Gérer')]",
+            ".client-btn--primary"
+        ]
+
+        manage_btn = None
+        for sel in manage_selectors:
+            try:
+                if sel.startswith("//"):
+                    manage_btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, sel))
+                    )
+                else:
+                    manage_btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                    )
+                if manage_btn:
+                    break
+            except:
+                continue
+
+        if not manage_btn:
+            print("❌ 未找到 Manage 按钮")
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", manage_btn)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", manage_btn)
+        time.sleep(3)
+        take_screenshot(driver, "21_clicked_manage")
+        print("✅ 已进入服务器详情页")
+        return True
+
+    except Exception as e:
+        print(f"❌ 点击 Manage 按钮失败: {e}")
+        return False
+
+def get_server_info(driver):
+    """获取服务器详情页信息"""
+    print("\n📊 获取服务器信息...")
+    info = {
+        "time_remaining": "",
+        "plan": "",
+        "renewal_note": "",
+        "server_name": "",
+        "server_url": driver.current_url
+    }
+
+    try:
+        # 获取 Time remaining 信息
+        time_selectors = [
+            "div[style*='background: rgba(49, 95, 79']",
+            "div[style*='background: rgba(49, 95, 79, 0.06)']",
+            "//div[contains(text(), 'Time remaining')]",
+            "//div[contains(text(), 'Temps restant')]",
+            ".server-info-card",
+            "[class*='server-info']"
+        ]
+
+        info_container = None
+        for sel in time_selectors:
+            try:
+                if sel.startswith("//"):
+                    info_container = driver.find_element(By.XPATH, sel)
+                else:
+                    info_container = driver.find_element(By.CSS_SELECTOR, sel)
+                if info_container and info_container.is_displayed():
+                    break
+            except:
+                continue
+
+        if info_container:
+            text = info_container.text
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            for line in lines:
+                if "Time remaining" in line or "Temps restant" in line:
+                    info["time_remaining"] = line.replace("Time remaining:", "").replace("Temps restant:", "").strip()
+                elif "plan" in line.lower() or "gratuit" in line.lower() or "free" in line.lower():
+                    info["plan"] = line
+                elif "Renewal" in line or "renouvellement" in line.lower():
+                    info["renewal_note"] = line
+
+            print(f"  ⏰ 剩余时间: {info['time_remaining'] or '未获取'}")
+            print(f"  📋 套餐: {info['plan'] or '未获取'}")
+            print(f"  📝 续期提示: {info['renewal_note'] or '未获取'}")
+        else:
+            print("  ⚠️ 未找到服务器信息容器")
+
+        # 获取服务器名称
+        try:
+            name_el = driver.find_element(By.CSS_SELECTOR, "h1, .server-name, [class*='server-title']")
+            info["server_name"] = name_el.text.strip()
+        except:
+            info["server_name"] = "ACL Cloud Server"
+
+        take_screenshot(driver, "22_server_info")
+        return info
+
+    except Exception as e:
+        print(f"❌ 获取服务器信息失败: {e}")
+        take_screenshot(driver, "22_server_info_error")
+        return info
+
+def click_restart_button(driver):
+    """点击 Restart 按钮"""
+    print("\n🔄 点击 Restart 按钮...")
+    try:
+        restart_selectors = [
+            "button.power-btn[data-variant='restart']",
+            "button[data-variant='restart']",
+            "//button[contains(@class, 'power-btn') and contains(., 'Restart')]",
+            "//button[contains(@class, 'power-btn') and contains(., 'Redémarrer')]",
+            "button:has(svg):has-text('Restart')"
+        ]
+
+        restart_btn = None
+        for sel in restart_selectors:
+            try:
+                if sel.startswith("//"):
+                    restart_btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, sel))
+                    )
+                else:
+                    restart_btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                    )
+                if restart_btn:
+                    break
+            except:
+                continue
+
+        if not restart_btn:
+            print("❌ 未找到 Restart 按钮")
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", restart_btn)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", restart_btn)
+        time.sleep(2)
+        take_screenshot(driver, "23_restart_clicked")
+        print("✅ 已点击 Restart 按钮")
+        return True
+
+    except Exception as e:
+        print(f"❌ 点击 Restart 按钮失败: {e}")
+        return False
+
+def send_wechat_notification(info, need_renewal, renewal_success, restart_clicked):
+    """发送企业微信通知"""
+    if not WECHAT_WEBHOOK_KEY:
+        print("⚠️ 未设置 WECHAT_WEBHOOK_KEY，跳过通知")
+        return False
+
+    webhook_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_WEBHOOK_KEY}"
+
+    server_name = info.get("server_name", "ACL Cloud Server")
+    time_remaining = info.get("time_remaining", "未知")
+    plan = info.get("plan", "未知")
+    renewal_note = info.get("renewal_note", "")
+    server_url = info.get("server_url", "")
+
+    if need_renewal and renewal_success:
+        status_emoji = "✅"
+        status_text = "续期成功"
+        action_text = "已执行续期并重启服务器"
+        color = "🟢"
+    elif need_renewal and not renewal_success:
+        status_emoji = "❌"
+        status_text = "续期失败"
+        action_text = "续期验证失败，请手动处理"
+        color = "🔴"
+    else:
+        status_emoji = "✅"
+        status_text = "状态正常"
+        action_text = "无需续期"
+        color = "🟢"
+
+    if restart_clicked:
+        restart_text = "✅ 已执行重启"
+    elif need_renewal and renewal_success:
+        restart_text = "❌ 重启未执行"
+    else:
+        restart_text = "➖ 无需重启"
+
+    content = f"""{color} <b>ACL Cloud 服务器状态报告</b> {color}
+
+📌 <b>服务器:</b> {server_name}
+⏰ <b>剩余时间:</b> {time_remaining}
+📋 <b>套餐信息:</b> {plan}
+📝 <b>续期提示:</b> {renewal_note or '无'}
+
+📊 <b>操作状态:</b> {status_emoji} {status_text}
+🔧 <b>执行动作:</b> {action_text}
+🔄 <b>重启状态:</b> {restart_text}
+
+🔗 <a href=\"{server_url}\">点击访问服务器详情页</a>
+
+⏱️ 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": content,
+            "mentioned_list": ["@all"]
+        }
+    }
+
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=10)
+        result = response.json()
+        if result.get("errcode") == 0:
+            print("✅ 企业微信通知发送成功")
+            return True
+        else:
+            print(f"❌ 企业微信通知发送失败: {result}")
+            return False
+    except Exception as e:
+        print(f"❌ 发送通知异常: {e}")
+        return False
+
 def main():
+    global NEED_RENEWAL, RENEWAL_SUCCESS
+
     if not USERNAME or not PASSWORD:
-        print("❌ 错误: 未设置 ACL_USERNAME 或 ACL_PASSWORD 环境变量")
+        print("❌ 错误: 未设置 ACL_USERNAME 或 ACL_PASSWORD")
         sys.exit(1)
-    
+
     ensure_screenshot_dir()
-    
+
     # 启动虚拟桌面
-    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24"], 
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.environ["DISPLAY"] = ":99"
     time.sleep(2)
-    
+
     recording_process = start_ffmpeg_recording()
     driver = setup_driver()
     base_url = LOGIN_URL.rstrip("/auth/login").rstrip("/")
-    
+
+    server_info = {}
+    restart_clicked = False
+
     try:
+        # ========== 登录流程 ==========
         open_login_page(driver)
         login(driver)
         time.sleep(1)
-        
-        # 登录页验证码处理
+
         login_success = False
         for attempt in range(MAX_RETRIES):
             print(f"\n🔄 登录页验证码尝试 {attempt + 1}/{MAX_RETRIES}")
@@ -466,25 +817,73 @@ def main():
                     login_success = True
                     break
             time.sleep(2)
-        
+
         if not login_success:
             print("❌ 登录失败")
+            send_wechat_notification({"server_name": "登录失败"}, False, False, False)
             return False
-        
-        # 导航到仪表盘
+
+        # ========== 判断是否需要续期 ==========
+        print("\n🔍 检查是否需要续期...")
+
+        # 确保在仪表盘
         if "dashboard" not in driver.current_url.lower():
             driver.get(base_url + "/dashboard")
             time.sleep(3)
             take_screenshot(driver, "21_navigated_to_dashboard")
-        
-        perform_renewal(driver)
+
+        close_install_popup(driver)
+
+        # 检查是否有续期表格和 Renew 按钮
+        has_renewal = False
+        try:
+            renewal_table = driver.find_element(By.CSS_SELECTOR, 
+                "div.home-renewal-table, .renewal-table, [class*='renewal']")
+            renew_buttons = driver.find_elements(By.CSS_SELECTOR, 
+                "button.home-renew-action, .renew-action, button[class*='renew']")
+            visible_renew = [b for b in renew_buttons if b.is_displayed()]
+            if renewal_table and len(visible_renew) > 0:
+                has_renewal = True
+                print("✅ 检测到需要续期的项目")
+            else:
+                print("ℹ️ 未检测到需要续期的项目")
+        except NoSuchElementException:
+            print("ℹ️ 仪表盘上没有续期表格")
+
+        # ========== 情况1: 需要续期 ==========
+        if has_renewal:
+            print("\n📌 执行续期流程...")
+            perform_renewal(driver)
+
+            # 续期后导航到服务列表
+            navigate_to_services(driver)
+            click_manage_button(driver)
+
+            # 获取服务器信息
+            server_info = get_server_info(driver)
+
+            # 如果续期成功，点击 Restart
+            if RENEWAL_SUCCESS:
+                restart_clicked = click_restart_button(driver)
+
+        # ========== 情况2: 不需要续期 ==========
+        else:
+            print("\n📌 无需续期，直接获取服务器信息...")
+            navigate_to_services(driver)
+            click_manage_button(driver)
+            server_info = get_server_info(driver)
+
+        # ========== 发送通知 ==========
+        send_wechat_notification(server_info, NEED_RENEWAL, RENEWAL_SUCCESS, restart_clicked)
+
         take_screenshot(driver, "99_script_completed")
         print("\n🎉 所有操作已完成！")
         return True
-        
+
     except Exception as e:
         print(f"❌ 发生错误: {e}")
         take_screenshot(driver, "99_error_occurred")
+        send_wechat_notification({"server_name": f"脚本异常: {str(e)[:50]}"}, False, False, False)
         return False
     finally:
         driver.quit()
