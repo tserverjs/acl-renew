@@ -3,7 +3,7 @@
 """
 ============================================
   ACL Cloud 自动登录 + 续期脚本（全步骤截图版）
-  版本：v4.0
+  版本：v4.1
   功能：自动登录 ACL Cloud，处理验证码，执行续期，每一步都截图
   依赖：selenium, pillow, pytesseract, requests
 ============================================
@@ -57,7 +57,6 @@ def setup_driver():
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option("useAutomationIntegration", False)
     
     chrome_options.binary_location = "/usr/bin/chromium-browser"
     
