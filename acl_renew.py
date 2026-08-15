@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 ============================================
-  ACL Cloud 自动登录 + 续期脚本（全流程录屏版）
-  版本：v5.0
-  功能：自动登录、处理登录页验证码、点击续期按钮、处理续期弹窗验证码
+  ACL Cloud 自动登录 + 续期脚本（WebM通用录屏版）
+  版本：v5.1
+  功能：自动登录、双验证码处理、FFmpeg生成全平台兼容WebM录屏
   依赖：selenium, pillow, pytesseract, requests
 ============================================
 """
@@ -12,6 +12,7 @@
 import os
 import sys
 import time
+import subprocess
 import requests
 from io import BytesIO
 from datetime import datetime
@@ -30,6 +31,7 @@ PASSWORD = os.getenv("ACL_PASSWORD", "")
 LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
 MAX_RETRIES = 3
 SCREENSHOT_DIR = "screenshots"
+RECORDING_FILE = "full_operation_recording.webm"
 # =============================
 
 def ensure_screenshot_dir():
@@ -45,6 +47,38 @@ def take_screenshot(driver, step_name):
     driver.save_screenshot(filename)
     print(f"📸 截图已保存: {filename}")
     return filename
+
+def start_ffmpeg_recording():
+    """启动 ffmpeg 屏幕录制，生成全平台通用 WebM 视频"""
+    print("🎥 启动 ffmpeg WebM 全程录屏...")
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-f", "x11grab",
+        "-video_size", "1920x1080",
+        "-i", ":99",
+        "-r", "15",
+        "-c:v", "libvpx-vp9",
+        "-crf", "30",
+        "-b:v", "2M",
+        "-deadline", "realtime",
+        "-c:a", "libopus",
+        "-y",
+        RECORDING_FILE
+    ]
+    process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    print(f"✅ WebM 录屏已启动，输出文件: {RECORDING_FILE}")
+    return process
+
+def stop_ffmpeg_recording(process):
+    """停止 ffmpeg 录屏进程"""
+    print("⏹️  停止 ffmpeg 录屏...")
+    process.terminate()
+    process.wait()
+    print(f"✅ WebM 录屏已保存完成")
 
 def setup_driver():
     """配置并启动 Chrome 浏览器（配合虚拟桌面运行）"""
@@ -285,6 +319,12 @@ def main():
         sys.exit(1)
     
     ensure_screenshot_dir()
+    
+    # 启动虚拟桌面和录屏
+    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.environ["DISPLAY"] = ":99"
+    recording_process = start_ffmpeg_recording()
+    
     driver = setup_driver()
     base_url = LOGIN_URL.rstrip("/auth/login").rstrip("/")
     
@@ -325,6 +365,7 @@ def main():
         return False
     finally:
         driver.quit()
+        stop_ffmpeg_recording(recording_process)
 
 if __name__ == "__main__":
     success = main()
