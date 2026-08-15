@@ -1,137 +1,52 @@
-name: Kerit Cloud Renew with CloakBrowser
+name: ACL Cloud Auto Login
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *'
+    # 每天凌晨2点运行（可根据需要调整）
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
-  run-stealth-login:
+  login:
     runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: 📦 安装系统底层依赖
-      run: |
-        sudo apt-get update -y
-        echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | sudo debconf-set-selections
-        sudo apt-get install -y \
-          xvfb curl wget wmctrl ffmpeg scrot \
-          fonts-noto-color-emoji xdotool \
-          x11-utils x11-xserver-utils ttf-mscorefonts-installer \
-          libnss3 libatk-bridge2.0-0 libxss1 libgtk-3-0
-        sudo fc-cache -f -v
-
-    - name: 🌐 启动 GOST 代理隧道
-      env:
-        GOST_PROXY: ${{ secrets.GOST_PROXY }}
-      run: |
-        VERSION=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-        wget -q "https://github.com/go-gost/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
-        tar -xzf gost_${VERSION}_linux_amd64.tar.gz
-        chmod +x ./gost
-        nohup ./gost -L socks5://:40000 -F "${GOST_PROXY}" > gost-proxy.log 2>&1 &
-        
-        echo "⏳ 等待代理隧道建立..."
-        for i in {1..30}; do
-          sleep 1
-          EXIT_IP=$(curl -s --max-time 5 --proxy socks5://127.0.0.1:40000 https://api.ipify.org 2>/dev/null || true)
-          if [ -n "${EXIT_IP}" ]; then
-            echo "✅ 代理就绪，出口IP: ${EXIT_IP}"
-            break
-          fi
-          echo "  第 $i 秒等待中..."
-        done
-        
-        if [ -z "${EXIT_IP}" ]; then
-          echo "❌ 代理隧道连接失败"
-          cat gost-proxy.log
-          exit 1
-        fi
-
-    - name: Install Python Dependencies
-      run: |
-        pip install cloakbrowser playwright
-        playwright install chromium
-
-    - name: 🎬 启动虚拟桌面并执行自动化
-      env:
-        KERIT_ACCOUNT: ${{ secrets.KERIT_ACCOUNT }}
-        WECHAT_KEY: ${{ secrets.WECHAT_WEBHOOK }}
-      run: |
-        # 1. 启动虚拟桌面
-        Xvfb :99 -ac -screen 0 1920x1080x24 +extension RANDR > /dev/null 2>&1 &
-        sleep 3
-        
-        export DISPLAY=:99
-        
-        # 2. 初始化屏幕录像机
-        echo "🎥 正在初始化屏幕录像机..."
-        ffmpeg -f x11grab -video_size 1920x1080 -i :99.0 \
-          -codec:v libx264 -pix_fmt yuv420p -r 30 \
-          cloak_run_record.mp4 > ffmpeg.log 2>&1 &
-        FFMPEG_PID=$!
-        sleep 2
-
-        # 3. ── 通过命令行拉起 CloakBrowser 并注入代理 ──
-        echo "🌐 正在从命令行启动 CloakBrowser..."
-        cloakbrowser --remote-debugging-port=9222 --proxy-server="socks5://127.0.0.1:40000" --no-sandbox > cloakbrowser.log 2>&1 &
-        
-        # ⏳ 核心防摔：强制等待 6 秒，让浏览器完全在 9222 端口把 CDP 备好
-        echo "⏳ 等待 CloakBrowser 端口就绪..."
-        sleep 6
-
-        # 4. 窗口最大化守护进程
-        (
-          export DISPLAY=:99
-          for i in {1..60}; do
-            sleep 1
-            WINDOW_ID=$(wmctrl -l 2>/dev/null | grep -iE "chrome|chromium|cloak" | head -1 | awk '{print $1}')
-            if [ -n "$WINDOW_ID" ]; then
-              echo "🎯 捕获到浏览器窗口，执行最大化..."
-              wmctrl -i -r "$WINDOW_ID" -b add,maximized_vert,maximized_horz 2>/dev/null || true
-              wmctrl -i -a "$WINDOW_ID" 2>/dev/null || true
-              break
-            fi
-          done
-        ) &
-
-        # 5. 运行 Python 脚本
-        echo "🚀 开始运行 CloakBrowser 自动化脚本..."
-        python auto-renew.py || touch .script_failed
-
-        # 6. 录像善后并清理后台浏览器
-        echo "🛑 脚本运行完毕，正在保存录像..."
-        kill -SIGINT $FFMPEG_PID 2>/dev/null || true
-        pkill -f cloakbrowser || true
-        sleep 3
-        kill $FFMPEG_PID 2>/dev/null || true
-        sleep 1
-
-        if [ -f .script_failed ]; then
-          echo "❌ 脚本执行遭遇异常"
-          exit 1
-        fi
-
-    - name: 📦 上传操作录像（无论成败）
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: execution-video-record
-        path: cloak_run_record.mp4
-        retention-days: 7
-
-    - name: 📦 上传调试截图（无论成败）
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: debug-screenshots
-        path: |
-          *.png
-        retention-days: 7
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            chromium-browser \
+            chromium-chromedriver \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            libtesseract-dev \
+            libleptonica-dev \
+            pkg-config
+      
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install selenium pillow pytesseract requests
+      
+      - name: Run login script
+        env:
+          ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
+          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+          ACL_LOGIN_URL: ${{ secrets.ACL_LOGIN_URL }}
+        run: python acl_renew.py
+      
+      - name: Upload error screenshot (if failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot
+          path: error_screenshot.png
+          retention-days: 7
