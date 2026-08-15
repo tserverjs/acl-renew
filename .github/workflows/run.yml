@@ -102,7 +102,7 @@ jobs:
         with:
           name: full-screenshots-${{ github.run_id }}
           path: screenshots/
-          retention-days: 30  # 保留 30 天，方便长期排查
+          retention-days: 30
           if-no-files-found: warn
       
       - name: 📬 输出操作结果
