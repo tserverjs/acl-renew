@@ -1,0 +1,59 @@
+name: 🧹 删除所有工作流运行记录
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_count:
+        description: '保留最近的运行次数（0=全部删除）'
+        required: true
+        default: '0'
+        type: string
+
+jobs:
+  delete-all:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 删除所有运行记录
+        env:
+          REPO: ${{ github.repository }}
+          KEEP: ${{ github.event.inputs.keep_count }}
+          TOKEN: ${{ github.token }}
+        run: |
+          PAGE=1
+          while true; do
+            # 获取一页运行记录
+            RESPONSE=$(curl -s -H "Authorization: token $TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/runs?per_page=100&page=$PAGE")
+
+            RUN_IDS=$(echo "$RESPONSE" | jq -r '.workflow_runs[].id')
+
+            # 没有数据就退出
+            if [ -z "$RUN_IDS" ]; then
+              echo "没有更多运行记录了"
+              break
+            fi
+
+            # 跳过要保留的
+            if [ "$PAGE" -eq 1 ] && [ "$KEEP" -gt 0 ]; then
+              RUN_IDS=$(echo "$RUN_IDS" | tail -n +$((KEEP + 1)))
+            fi
+
+            # 逐个删除
+            for id in $RUN_IDS; do
+              echo "Deleting run $id"
+              curl -s -X DELETE -H "Authorization: token $TOKEN" \
+                "https://api.github.com/repos/$REPO/actions/runs/$id"
+            done
+
+            PAGE=$((PAGE + 1))
+
+            # 安全上限，防止无限循环
+            if [ "$PAGE" -gt 20 ]; then
+              echo "达到页数上限"
+              break
+            fi
+          done
+
+          echo "清理完成"
