@@ -1,15 +1,12 @@
 # ============================================
-# ACL Cloud 自动续期工作流（WebM通用录屏完整版）
-# 功能：自动登录、双验证码处理、全平台兼容WebM录屏、全步骤截图
-# 触发方式：定时任务 + 手动触发
+# ACL Cloud 自动续期工作流（MP4兼容录屏版）
 # ============================================
 
-name: 🔐 ACL Cloud 自动续期（WebM录屏完整版）
+name: 🔐 ACL Cloud 自动续期（MP4兼容录屏版）
 
 on:
   schedule:
     - cron: '0 2,14 * * *'
-  
   workflow_dispatch:
     inputs:
       log_level:
@@ -33,7 +30,7 @@ permissions:
 
 jobs:
   login-and-renew:
-    name: 🚀 自动登录续期+WebM录屏
+    name: 🚀 自动登录续期+MP4录屏
     runs-on: ubuntu-latest
     timeout-minutes: 20
     
@@ -43,13 +40,13 @@ jobs:
         with:
           fetch-depth: 1
       
-      - name: 🐍 配置 Python ${{ env.PYTHON_VERSION }} 环境
+      - name: 🐍 配置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       
-      - name: 📦 安装系统全依赖
+      - name: 📦 安装系统依赖
         run: |
           echo "🔧 正在安装系统依赖..."
           sudo apt-get update -qq
@@ -80,18 +77,19 @@ jobs:
           echo "  - Tesseract 版本：$(tesseract --version | head -1)"
           echo "  - FFmpeg 版本：$(ffmpeg -version | head -1)"
       
-      - name: 🎬 启动虚拟桌面 + FFmpeg WebM 全程录屏
+      - name: 🎬 启动虚拟桌面 + FFmpeg MP4 全程录屏
         run: |
           echo "🖥️ 启动虚拟显示服务..."
           Xvfb $DISPLAY -screen 0 1920x1080x24 &
           sleep 2
           
-          echo "🎥 启动 FFmpeg 后台录屏..."
+          echo "🎥 启动 FFmpeg 后台录屏 (H.264 MP4)..."
           ffmpeg -f x11grab -video_size 1920x1080 -i $DISPLAY -r 15 \
-            -c:v libvpx-vp9 -crf 30 -b:v 2M -deadline realtime \
-            -c:a libopus -y full_operation_recording.webm &
+            -pix_fmt yuv420p -c:v libx264 -preset ultrafast -crf 28 \
+            -movflags +faststart -c:a aac -b:a 128k \
+            -y full_operation_recording.mp4 &
           echo $! > ffmpeg_pid.txt
-          echo "✅ WebM 录屏已启动"
+          echo "✅ MP4 录屏已启动"
       
       - name: 🏃 执行登录和续期脚本
         id: automation
@@ -116,9 +114,11 @@ jobs:
         if: always()
         run: |
           echo "🛑 停止录屏进程..."
-          kill $(cat ffmpeg_pid.txt) || true
-          sleep 3
-          echo "✅ WebM 录屏已保存为 full_operation_recording.webm"
+          if [ -f ffmpeg_pid.txt ]; then
+            kill $(cat ffmpeg_pid.txt) || true
+            sleep 3
+          fi
+          echo "✅ MP4 录屏已保存"
       
       - name: 📸 上传全步骤截图
         if: always()
@@ -134,7 +134,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: full-operation-recording-${{ github.run_id }}
-          path: full_operation_recording.webm
+          path: full_operation_recording.mp4
           retention-days: 30
           if-no-files-found: warn
       
@@ -155,12 +155,10 @@ jobs:
           
           if [ "$STATUS" == "success" ]; then
             echo "🎉 自动续期成功！"
-            echo "📸 全步骤截图已上传到 Artifacts"
-            echo "🎥 全程操作录屏已上传到 Artifacts"
           else
             echo "❌ 自动续期失败，请检查截图和录屏排查问题。"
-            echo "📸 全步骤截图已上传到 Artifacts"
-            echo "🎥 全程操作录屏已上传到 Artifacts"
           fi
+          echo "📸 全步骤截图已上传到 Artifacts"
+          echo "🎥 全程操作录屏已上传到 Artifacts (MP4格式，全平台兼容)"
           echo ""
           echo "================================"
