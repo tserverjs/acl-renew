@@ -1,18 +1,15 @@
 # ============================================
-# ACL Cloud 自动登录工作流
-# 功能：自动登录 ACL Cloud 并处理验证码
+# ACL Cloud 自动登录 + 续期工作流（全步骤截图版）
+# 功能：自动登录 ACL Cloud，处理验证码，执行续期，每一步都截图
 # 触发方式：定时任务 + 手动触发
 # ============================================
 
-name: 🔐 ACL Cloud 自动登录
+name: 🔐 ACL Cloud 自动续期（全步骤截图）
 
-# 触发条件配置
 on:
-  # 定时任务：每天凌晨 2:00 和下午 14:00 运行
   schedule:
     - cron: '0 2,14 * * *'
   
-  # 手动触发：可在 Actions 页面点击按钮运行
   workflow_dispatch:
     inputs:
       log_level:
@@ -26,43 +23,31 @@ on:
           - warning
           - error
 
-# 环境变量
 env:
   PYTHON_VERSION: '3.11'
-  CHROMIUM_VERSION: 'latest'
 
-# 权限配置
 permissions:
   contents: read
   actions: write
 
 jobs:
-  # ========== 登录任务 ==========
-  login:
-    name: 🚀 执行自动登录
+  login-and-renew:
+    name: 🚀 自动登录并续期（全步骤截图）
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # 超时时间 10 分钟
-    
-    # 步骤执行策略
-    strategy:
-      max-parallel: 1
-      fail-fast: false
+    timeout-minutes: 15
     
     steps:
-      # 步骤 1：检出代码
       - name: 📥 检出仓库代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # 只获取最新代码，加快速度
+          fetch-depth: 1
       
-      # 步骤 2：设置 Python 环境
       - name: 🐍 配置 Python ${{ env.PYTHON_VERSION }} 环境
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'  # 缓存 pip 依赖，加速后续运行
+          cache: 'pip'
       
-      # 步骤 3：安装系统依赖
       - name: 📦 安装系统依赖
         run: |
           echo "🔧 正在安装系统依赖..."
@@ -77,110 +62,70 @@ jobs:
             pkg-config
           echo "✅ 系统依赖安装完成"
       
-      # 步骤 4：安装 Python 依赖
       - name: 📦 安装 Python 依赖
         run: |
           echo "🔧 正在安装 Python 依赖..."
           pip install --upgrade pip -q
-          pip install \
-            selenium \
-            pillow \
-            pytesseract \
-            requests \
-            -q
+          pip install selenium pillow pytesseract requests -q
           echo "✅ Python 依赖安装完成"
       
-      # 步骤 5：验证环境配置
       - name: 🔍 验证环境配置
         run: |
           echo "📋 环境信息："
           echo "  - Python 版本：$(python --version)"
           echo "  - Chromium 版本：$(chromium-browser --version)"
           echo "  - Tesseract 版本：$(tesseract --version | head -1)"
-          echo "  - ChromeDriver 版本：$(chromedriver --version)"
       
-      # 步骤 6：执行登录脚本
-      - name: 🏃 执行登录脚本
-        id: login
+      - name: 🏃 执行登录和续期脚本（全步骤截图）
+        id: automation
         env:
           ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           ACL_LOGIN_URL: ${{ secrets.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
-          LOG_LEVEL: ${{ github.event.inputs.log_level || 'info' }}
         run: |
           echo "⏰ 开始时间：$(date '+%Y-%m-%d %H:%M:%S')"
-          echo "🔑 正在登录 ACL Cloud..."
+          echo "🔑 正在执行自动登录和续期（全步骤截图）..."
           
-          # 执行登录脚本并捕获结果
-          if python acl_renew.py; then
-            echo "✅ 登录成功！"
+          if python login_script.py; then
+            echo "✅ 操作成功完成！"
             echo "status=success" >> $GITHUB_OUTPUT
           else
-            echo "❌ 登录失败！"
+            echo "❌ 操作失败！"
             echo "status=failure" >> $GITHUB_OUTPUT
             exit 1
           fi
       
-      # 步骤 7：上传错误截图（仅失败时）
-      - name: 📸 上传错误截图
-        if: failure()
+      # 上传所有截图（无论成功还是失败）
+      - name: 📸 上传全步骤截图
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: error-screenshot-${{ github.run_id }}
-          path: |
-            error_screenshot.png
-            login_failed.png
-          retention-days: 7  # 保留 7 天
+          name: full-screenshots-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 30  # 保留 30 天，方便长期排查
           if-no-files-found: warn
       
-      # 步骤 8：发送通知（可选）
-      - name: 📬 发送通知
+      - name: 📬 输出操作结果
         if: always()
         run: |
-          STATUS="${{ steps.login.outputs.status }}"
+          STATUS="${{ steps.automation.outputs.status }}"
           TIME="$(date '+%Y-%m-%d %H:%M:%S')"
           
-          if [ "$STATUS" == "success" ]; then
-            echo "🎉 ACL Cloud 自动登录成功！"
-            echo "⏰ 时间：$TIME"
-          else
-            echo "❌ ACL Cloud 自动登录失败！"
-            echo "⏰ 时间：$TIME"
-            echo "📸 截图已保存到 Artifacts"
-          fi
-      
-      # 步骤 9：清理临时文件
-      - name: 🧹 清理临时文件
-        if: always()
-        run: |
-          echo "🧹 正在清理临时文件..."
-          rm -f error_screenshot.png login_failed.png
-          echo "✅ 清理完成"
-
-  # ========== 状态检查任务 ==========
-  status-check:
-    name: 📊 登录状态检查
-    needs: login
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: 📋 检查登录结果
-        run: |
           echo "================================"
-          echo "   ACL Cloud 自动登录报告"
+          echo "   ACL Cloud 自动续期报告"
           echo "================================"
           echo ""
-          echo "📅 运行时间：$(date '+%Y-%m-%d %H:%M:%S')"
+          echo "📅 运行时间：$TIME"
           echo "🆔 运行编号：${{ github.run_id }}"
-          echo "📊 登录状态：${{ needs.login.result }}"
+          echo "📊 操作状态：$STATUS"
           echo ""
           
-          if [ "${{ needs.login.result }}" == "success" ]; then
-            echo "🎉 恭喜！自动登录成功！"
+          if [ "$STATUS" == "success" ]; then
+            echo "🎉 自动续期成功！"
+            echo "📸 全步骤截图已上传到 Artifacts"
           else
-            echo "⚠️ 自动登录失败，请检查配置或手动登录。"
+            echo "❌ 自动续期失败，请检查截图排查问题。"
+            echo "📸 全步骤截图已上传到 Artifacts，请下载查看"
           fi
-          
           echo ""
           echo "================================"
