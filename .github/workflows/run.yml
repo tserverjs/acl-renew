@@ -1,10 +1,10 @@
 # ============================================
-# ACL Cloud 自动登录 + 续期工作流（全功能完整版）
-# 功能：自动登录、验证码处理、续期弹窗验证、FFmpeg全程录屏、全步骤截图
+# ACL Cloud 自动续期工作流（WebM通用录屏完整版）
+# 功能：自动登录、双验证码处理、全平台兼容WebM录屏、全步骤截图
 # 触发方式：定时任务 + 手动触发
 # ============================================
 
-name: 🔐 ACL Cloud 自动续期（全功能完整版）
+name: 🔐 ACL Cloud 自动续期（WebM录屏完整版）
 
 on:
   schedule:
@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   login-and-renew:
-    name: 🚀 自动登录续期+全程录屏
+    name: 🚀 自动登录续期+WebM录屏
     runs-on: ubuntu-latest
     timeout-minutes: 20
     
@@ -80,16 +80,18 @@ jobs:
           echo "  - Tesseract 版本：$(tesseract --version | head -1)"
           echo "  - FFmpeg 版本：$(ffmpeg -version | head -1)"
       
-      - name: 🎬 启动虚拟桌面 + FFmpeg 全程录屏
+      - name: 🎬 启动虚拟桌面 + FFmpeg WebM 全程录屏
         run: |
           echo "🖥️ 启动虚拟显示服务..."
           Xvfb $DISPLAY -screen 0 1920x1080x24 &
           sleep 2
           
           echo "🎥 启动 FFmpeg 后台录屏..."
-          ffmpeg -f x11grab -video_size 1920x1080 -i $DISPLAY -r 15 -c:v libx264 -preset ultrafast -y operation_recording.mp4 &
+          ffmpeg -f x11grab -video_size 1920x1080 -i $DISPLAY -r 15 \
+            -c:v libvpx-vp9 -crf 30 -b:v 2M -deadline realtime \
+            -c:a libopus -y full_operation_recording.webm &
           echo $! > ffmpeg_pid.txt
-          echo "✅ 录屏已启动"
+          echo "✅ WebM 录屏已启动"
       
       - name: 🏃 执行登录和续期脚本
         id: automation
@@ -116,7 +118,7 @@ jobs:
           echo "🛑 停止录屏进程..."
           kill $(cat ffmpeg_pid.txt) || true
           sleep 3
-          echo "✅ 录屏已保存为 operation_recording.mp4"
+          echo "✅ WebM 录屏已保存为 full_operation_recording.webm"
       
       - name: 📸 上传全步骤截图
         if: always()
@@ -132,7 +134,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: full-operation-recording-${{ github.run_id }}
-          path: operation_recording.mp4
+          path: full_operation_recording.webm
           retention-days: 30
           if-no-files-found: warn
       
