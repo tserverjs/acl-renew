@@ -86,7 +86,7 @@ jobs:
           echo "⏰ 开始时间：$(date '+%Y-%m-%d %H:%M:%S')"
           echo "🔑 正在执行自动登录和续期（全步骤截图）..."
           
-          if python login_script.py; then
+          if python acl_renew.py; then
             echo "✅ 操作成功完成！"
             echo "status=success" >> $GITHUB_OUTPUT
           else
