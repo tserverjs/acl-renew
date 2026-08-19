@@ -45,7 +45,7 @@ jobs:
       - name: Run automation
         run: |
           mkdir -p videos
-          python3 acl_cloud_playwright.py
+          python3 acl_renewal.py
         env:
           PYTHONUNBUFFERED: "1"
 
