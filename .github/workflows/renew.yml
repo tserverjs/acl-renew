@@ -1,0 +1,136 @@
+# ============================================
+# ACL Cloud 自动续期工作流（SeleniumBase 版 v7.1）
+# 功能：自动登录、语言切换、续期、状态检测、Start/Restart、通知、原生录屏
+# ============================================
+
+name: 🔐 ACL Cloud 自动续期（SeleniumBase 版）
+
+on:
+  schedule:
+    - cron: '0 2,14 * * *'
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: '日志级别'
+        required: true
+        default: 'info'
+        type: choice
+        options:
+          - debug
+          - info
+          - warning
+          - error
+
+env:
+  PYTHON_VERSION: '3.11'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  login-and-renew:
+    name: 🚀 自动登录续期 + 状态检测 + 原生录屏
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 📥 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 🐍 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 安装系统依赖（Tesseract OCR）
+        run: |
+          echo "🔧 安装系统依赖..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            libtesseract-dev \
+            libleptonica-dev \
+            pkg-config
+          echo "✅ 系统依赖安装完成"
+
+      - name: 📦 安装 Python 依赖
+        run: |
+          echo "🔧 安装 Python 依赖..."
+          pip install --upgrade pip -q
+          pip install seleniumbase pillow pytesseract requests -q
+          echo "✅ Python 依赖安装完成"
+
+      - name: 🔍 验证环境配置
+        run: |
+          echo "📋 环境信息："
+          echo "  - Python 版本：$(python --version)"
+          echo "  - Tesseract 版本：$(tesseract --version | head -1)"
+          echo "  - SeleniumBase 版本：$(python -c 'import seleniumbase; print(seleniumbase.__version__)')"
+
+      - name: 🏃 执行登录和续期脚本（SeleniumBase 原生录屏）
+        id: automation
+        env:
+          ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
+          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+          ACL_LOGIN_URL: ${{ secrets.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
+          WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
+        run: |
+          echo "⏰ 开始时间：$(date '+%Y-%m-%d %H:%M:%S')"
+          echo "🔑 正在执行自动登录和续期（SeleniumBase 原生录制中...）"
+
+          # --rec      : 启用原生视频录制
+          # --headless : Linux 无头环境必需
+          # -s         : 显示 print 输出
+          # -v         : 详细日志
+          pytest acl_renewal.py --rec --headless -s -v
+          EXIT_CODE=$?
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ 操作成功完成！"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ 操作失败（退出码: $EXIT_CODE）"
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📸 上传 SeleniumBase 日志与录屏
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seleniumbase-recording-${{ github.run_id }}
+          path: |
+            latest_logs/
+            recordings/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 📬 输出操作结果
+        if: always()
+        run: |
+          STATUS="${{ steps.automation.outputs.status }}"
+          TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+
+          echo "================================"
+          echo "   ACL Cloud 自动续期报告"
+          echo "================================"
+          echo ""
+          echo "📅 运行时间：$TIME"
+          echo "🆔 运行编号：${{ github.run_id }}"
+          echo "📊 操作状态：${STATUS:-unknown}"
+          echo ""
+
+          if [ "$STATUS" == "success" ]; then
+            echo "🎉 自动续期成功！"
+          else
+            echo "❌ 自动续期失败，请下载 Artifacts 查看录屏和日志。"
+          fi
+          echo ""
+          echo "📁 Artifacts 包含："
+          echo "   - SeleniumBase 原生录屏 (latest_logs/**/video.*)"
+          echo "   - 完整运行日志与截图"
+          echo ""
+          echo "================================"
