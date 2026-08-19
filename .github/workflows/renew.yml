@@ -1,20 +1,9 @@
-name: ACL Cloud Auto Renewal & Power Management
+name: ACL Cloud Auto (Playwright + No Xvfb)
 
 on:
-  # 每天 UTC 02:00 执行（北京时间 10:00）
   schedule:
     - cron: '0 2 * * *'
-  # 允许手动触发
   workflow_dispatch:
-    inputs:
-      debug:
-        description: '启用调试模式（保留截图和录屏）'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
 
 env:
   ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
@@ -25,73 +14,45 @@ env:
 jobs:
   auto-renewal:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
 
     steps:
-      # ========== 1. 检出代码 ==========
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # ========== 2. 安装系统依赖 ==========
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y             xvfb             ffmpeg             tesseract-ocr             tesseract-ocr-eng             tesseract-ocr-fra             chromium-browser             chromium-chromedriver             fonts-noto-cjk             fonts-wqy-zenhei             libgl1-mesa-glx             libglib2.0-0
-          echo "✅ 系统依赖安装完成"
-
-      # ========== 3. 设置 Python ==========
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ========== 4. 安装 Python 依赖 ==========
-      - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip
-          pip install             selenium==4.15.2             pillow==10.1.0             pytesseract==0.3.10             requests==2.31.0             webdriver-manager==4.0.1
-          echo "✅ Python 依赖安装完成"
 
-      # ========== 5. 验证依赖 ==========
-      - name: Verify dependencies
+      - name: Install dependencies
         run: |
-          python -c "import selenium; print(f'selenium: {selenium.__version__}')"
-          python -c "import PIL; print(f'PIL: {PIL.__version__}')"
-          python -c "import pytesseract; print(f'pytesseract: {pytesseract.get_tesseract_version()}')"
-          tesseract --version | head -1
-          chromium-browser --version
-          ffmpeg -version | head -1
-          echo "✅ 依赖验证完成"
+          sudo apt-get update
+          sudo apt-get install -y \
+            tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra \
+            ffmpeg \
+            fonts-noto-cjk fonts-wqy-zenhei
+          pip install playwright pillow pytesseract requests
+          playwright install chromium
+          echo "✅ 依赖安装完成"
 
-      # ========== 6. 运行自动化脚本 ==========
-      - name: Run ACL Cloud automation
+      - name: Verify Playwright
         run: |
-          mkdir -p screenshots
-          python acl_renewal.py
+          python -c "from playwright.sync_api import sync_playwright; print('Playwright OK')"
+          python -c "from playwright.sync_api import sync_playwright as sp; p=sp().__enter__(); b=p.chromium.launch(headless=True); print('Chromium headless launch OK'); b.close(); p.stop()"
+
+      - name: Run automation
+        run: |
+          mkdir -p videos
+          python3 acl_cloud_playwright.py
         env:
           PYTHONUNBUFFERED: "1"
 
-      # ========== 7. 上传截图 Artifact（调试或失败时）==========
-      - name: Upload screenshots
-        if: ${{ always() }}
+      - name: Upload video
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-${{ github.run_id }}-${{ github.run_attempt }}
-          path: screenshots/
-          retention-days: 7
-
-      # ========== 8. 上传录屏 Artifact（调试模式或失败时）==========
-      - name: Upload screen recording
-        if: ${{ always() && (github.event.inputs.debug == 'true' || failure()) }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: recording-${{ github.run_id }}-${{ github.run_attempt }}
-          path: full_operation_recording.mp4
+          name: screen-recording-${{ github.run_id }}-${{ github.run_attempt }}
+          path: videos/
           retention-days: 3
-
-      # ========== 9. 清理（可选）==========
-      - name: Cleanup
-        if: ${{ always() }}
-        run: |
-          rm -f full_operation_recording.mp4
-          echo "🧹 清理完成"
