@@ -1,4 +1,4 @@
-name: ACL Cloud Auto (Playwright + No Xvfb)
+name: ACL Cloud Auto (Playwright + Standard Sources)
 
 on:
   schedule:
@@ -25,17 +25,27 @@ jobs:
         with:
           python-version: '3.11'
 
+      # 1. 替换 Apt 源为阿里云镜像
+      - name: Change Apt Mirrors
+        run: |
+          sudo sed -i 's/azure.archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
+          sudo sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
+          sudo sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get update -o Acquire::http::Timeout="15"
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends \
             tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra \
-            ffmpeg \
             fonts-noto-cjk fonts-wqy-zenhei
-          pip install playwright pillow pytesseract requests
-          playwright install chromium
-          echo "✅ 依赖安装完成"
+
+          # 2. 替换 PyPI 源为清华镜像安装 Python 库
+          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --upgrade pip
+          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple playwright pillow pytesseract requests
+
+          # 3. 安装 Chromium 浏览器及其系统依赖 (内置源)
+          playwright install --with-deps chromium
+          echo "✅ 依赖与浏览器安装完成"
 
       - name: Verify Playwright
         run: |
