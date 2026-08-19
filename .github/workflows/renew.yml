@@ -1,150 +1,97 @@
-# ============================================
-# ACL Cloud 自动续期工作流（SeleniumBase 版 v7.3）
-# 新增：GOST 代理支持（通过 GOST_PROXY secret）
-# ============================================
-
-name: 🔐 ACL Cloud 自动续期（SeleniumBase 版）
+name: ACL Cloud Auto Renewal & Power Management
 
 on:
+  # 每天 UTC 02:00 执行（北京时间 10:00）
   schedule:
-    - cron: '0 2,14 * * *'
+    - cron: '0 2 * * *'
+  # 允许手动触发
   workflow_dispatch:
     inputs:
-      log_level:
-        description: '日志级别'
-        required: true
-        default: 'info'
+      debug:
+        description: '启用调试模式（保留截图和录屏）'
+        required: false
+        default: 'false'
         type: choice
         options:
-          - debug
-          - info
-          - warning
-          - error
+          - 'true'
+          - 'false'
 
 env:
-  PYTHON_VERSION: '3.11'
-
-permissions:
-  contents: read
-  actions: write
+  ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
+  ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+  ACL_LOGIN_URL: ${{ vars.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
+  WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
 
 jobs:
-  login-and-renew:
-    name: 🚀 自动登录续期 + 状态检测 + 原生录屏
+  auto-renewal:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
-      - name: 📥 检出仓库代码
+      # ========== 1. 检出代码 ==========
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: 🐍 配置 Python 环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: 📦 安装系统依赖（Tesseract OCR）
+      # ========== 2. 安装系统依赖 ==========
+      - name: Install system dependencies
         run: |
-          echo "🔧 安装系统依赖..."
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            tesseract-ocr \
-            tesseract-ocr-eng \
-            libtesseract-dev \
-            libleptonica-dev \
-            pkg-config
+          sudo apt-get update
+          sudo apt-get install -y             xvfb             ffmpeg             tesseract-ocr             tesseract-ocr-eng             tesseract-ocr-fra             chromium-browser             chromium-chromedriver             fonts-noto-cjk             fonts-wqy-zenhei             libgl1-mesa-glx             libglib2.0-0
           echo "✅ 系统依赖安装完成"
 
-      - name: 📦 安装 Python 依赖
+      # ========== 3. 设置 Python ==========
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ========== 4. 安装 Python 依赖 ==========
+      - name: Install Python dependencies
         run: |
-          echo "🔧 安装 Python 依赖..."
-          pip install --upgrade pip -q
-          pip install seleniumbase pillow pytesseract requests -q
+          pip install --upgrade pip
+          pip install             selenium==4.15.2             pillow==10.1.0             pytesseract==0.3.10             requests==2.31.0             webdriver-manager==4.0.1
           echo "✅ Python 依赖安装完成"
 
-      - name: 🔍 验证环境配置
+      # ========== 5. 验证依赖 ==========
+      - name: Verify dependencies
         run: |
-          echo "📋 环境信息："
-          echo "  - Python 版本：$(python --version)"
-          echo "  - Tesseract 版本：$(tesseract --version | head -1)"
-          echo "  - SeleniumBase 版本：$(python -c 'import seleniumbase; print(seleniumbase.__version__)')"
+          python -c "import selenium; print(f'selenium: {selenium.__version__}')"
+          python -c "import PIL; print(f'PIL: {PIL.__version__}')"
+          python -c "import pytesseract; print(f'pytesseract: {pytesseract.get_tesseract_version()}')"
+          tesseract --version | head -1
+          chromium-browser --version
+          ffmpeg -version | head -1
+          echo "✅ 依赖验证完成"
 
-      - name: 🌐 测试代理连通性（如有配置）
+      # ========== 6. 运行自动化脚本 ==========
+      - name: Run ACL Cloud automation
+        run: |
+          mkdir -p screenshots
+          python acl_renewal.py
         env:
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
-        run: |
-          if [ -n "$GOST_PROXY" ]; then
-            echo "🌐 检测到 GOST_PROXY: $GOST_PROXY"
-            echo "🧪 测试代理连通性..."
-            # 提取 host:port，测试 TCP 连通
-            PROXY_HOST=$(echo "$GOST_PROXY" | sed -E 's/.*@//; s/:.*//')
-            PROXY_PORT=$(echo "$GOST_PROXY" | sed -E 's/.*://')
-            timeout 5 bash -c "cat < /dev/null > /dev/tcp/$PROXY_HOST/$PROXY_PORT" && \
-              echo "✅ 代理 TCP 连通性正常" || \
-              echo "⚠️ 代理 TCP 连通性测试失败，继续执行..."
-          else
-            echo "ℹ️ 未配置 GOST_PROXY，使用直连"
-          fi
+          PYTHONUNBUFFERED: "1"
 
-      - name: 🏃 执行登录和续期脚本（SeleniumBase 原生录屏）
-        id: automation
-        env:
-          ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
-          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
-          ACL_LOGIN_URL: ${{ secrets.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
-          WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}   # <-- 新增：注入代理
-        run: |
-          echo "⏰ 开始时间：$(date '+%Y-%m-%d %H:%M:%S')"
-          echo "🔑 正在执行自动登录和续期（SeleniumBase 原生录制中...）"
-
-          pytest acl_renewal.py --rec --headless -s -v
-          EXIT_CODE=$?
-
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "✅ 操作成功完成！"
-            echo "status=success" >> $GITHUB_OUTPUT
-          else
-            echo "❌ 操作失败（退出码: $EXIT_CODE）"
-            echo "status=failure" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 📸 上传 SeleniumBase 日志与录屏
-        if: always()
+      # ========== 7. 上传截图 Artifact（调试或失败时）==========
+      - name: Upload screenshots
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: seleniumbase-recording-${{ github.run_id }}
-          path: |
-            latest_logs/
-            recordings/
-          retention-days: 30
-          if-no-files-found: warn
+          name: screenshots-${{ github.run_id }}-${{ github.run_attempt }}
+          path: screenshots/
+          retention-days: 7
 
-      - name: 📬 输出操作结果
-        if: always()
+      # ========== 8. 上传录屏 Artifact（调试模式或失败时）==========
+      - name: Upload screen recording
+        if: ${{ always() && (github.event.inputs.debug == 'true' || failure()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ github.run_id }}-${{ github.run_attempt }}
+          path: full_operation_recording.mp4
+          retention-days: 3
+
+      # ========== 9. 清理（可选）==========
+      - name: Cleanup
+        if: ${{ always() }}
         run: |
-          STATUS="${{ steps.automation.outputs.status }}"
-          TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-
-          echo "================================"
-          echo "   ACL Cloud 自动续期报告"
-          echo "================================"
-          echo ""
-          echo "📅 运行时间：$TIME"
-          echo "🆔 运行编号：${{ github.run_id }}"
-          echo "📊 操作状态：${STATUS:-unknown}"
-          echo ""
-
-          if [ "$STATUS" == "success" ]; then
-            echo "🎉 自动续期成功！"
-          else
-            echo "❌ 自动续期失败，请下载 Artifacts 查看录屏和日志。"
-          fi
-          echo ""
-          echo "📁 Artifacts 包含："
-          echo "   - SeleniumBase 原生录屏 (latest_logs/**/video.*)"
-          echo "   - 完整运行日志与截图"
-          echo ""
-          echo "================================"
+          rm -f full_operation_recording.mp4
+          echo "🧹 清理完成"
