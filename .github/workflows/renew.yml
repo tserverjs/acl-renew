@@ -1,6 +1,6 @@
 # ============================================
-# ACL Cloud 自动续期工作流（SeleniumBase 版 v7.1）
-# 功能：自动登录、语言切换、续期、状态检测、Start/Restart、通知、原生录屏
+# ACL Cloud 自动续期工作流（SeleniumBase 版 v7.3）
+# 新增：GOST 代理支持（通过 GOST_PROXY secret）
 # ============================================
 
 name: 🔐 ACL Cloud 自动续期（SeleniumBase 版）
@@ -71,6 +71,23 @@ jobs:
           echo "  - Tesseract 版本：$(tesseract --version | head -1)"
           echo "  - SeleniumBase 版本：$(python -c 'import seleniumbase; print(seleniumbase.__version__)')"
 
+      - name: 🌐 测试代理连通性（如有配置）
+        env:
+          GOST_PROXY: ${{ secrets.GOST_PROXY }}
+        run: |
+          if [ -n "$GOST_PROXY" ]; then
+            echo "🌐 检测到 GOST_PROXY: $GOST_PROXY"
+            echo "🧪 测试代理连通性..."
+            # 提取 host:port，测试 TCP 连通
+            PROXY_HOST=$(echo "$GOST_PROXY" | sed -E 's/.*@//; s/:.*//')
+            PROXY_PORT=$(echo "$GOST_PROXY" | sed -E 's/.*://')
+            timeout 5 bash -c "cat < /dev/null > /dev/tcp/$PROXY_HOST/$PROXY_PORT" && \
+              echo "✅ 代理 TCP 连通性正常" || \
+              echo "⚠️ 代理 TCP 连通性测试失败，继续执行..."
+          else
+            echo "ℹ️ 未配置 GOST_PROXY，使用直连"
+          fi
+
       - name: 🏃 执行登录和续期脚本（SeleniumBase 原生录屏）
         id: automation
         env:
@@ -78,14 +95,11 @@ jobs:
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           ACL_LOGIN_URL: ${{ secrets.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
           WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
+          GOST_PROXY: ${{ secrets.GOST_PROXY }}   # <-- 新增：注入代理
         run: |
           echo "⏰ 开始时间：$(date '+%Y-%m-%d %H:%M:%S')"
           echo "🔑 正在执行自动登录和续期（SeleniumBase 原生录制中...）"
 
-          # --rec      : 启用原生视频录制
-          # --headless : Linux 无头环境必需
-          # -s         : 显示 print 输出
-          # -v         : 详细日志
           pytest acl_renewal.py --rec --headless -s -v
           EXIT_CODE=$?
 
