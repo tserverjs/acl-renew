@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ============================================
-  ACL Cloud 自动续期（SeleniumBase 版 v7.1）
-  功能：自动登录、语言切换、续期、状态检测、Start/Restart、通知、原生录屏
+  ACL Cloud 自动续期（SeleniumBase 版 v7.3）
+  修复：增加 GOST 代理支持（通过环境变量 GOST_PROXY）
   运行方式: pytest test_acl_renewal.py --rec --headless -s
 ============================================
 """
@@ -21,6 +21,20 @@ from seleniumbase import BaseCase
 
 
 class TestAclRenewal(BaseCase):
+    # ==================== 新增：GOST 代理配置 ====================
+    def setUp(self):
+        """在测试开始前配置 GOST 代理"""
+        super().setUp()
+        self.gost_proxy = os.getenv("GOST_PROXY", "").strip()
+        if self.gost_proxy:
+            # SeleniumBase 原生支持 proxy 参数
+            # 格式: host:port 或 user:pass@host:port
+            self.proxy = self.gost_proxy
+            print(f"🌐 已启用 GOST 代理: {self.gost_proxy}")
+        else:
+            print("ℹ️ 未配置 GOST_PROXY，使用直连")
+    # ==========================================================
+
     def test_acl_renewal(self):
         # ========== 配置读取 ==========
         self.username = os.getenv("ACL_USERNAME", "")
@@ -81,20 +95,113 @@ class TestAclRenewal(BaseCase):
     def open_login_page(self):
         print(f"🌐 打开登录页面: {self.login_url}")
         self.open(self.login_url)
+        self.wait_for_ready_state_complete()
         self.sleep(3)
         print("✅ 登录页面已加载")
 
     def enter_credentials(self):
+        """多选择器兼容 + JS 兜底，确保能找到输入框"""
         print("🔑 输入用户名和密码...")
-        self.type("input[name='email'], input[type='email']", self.username)
-        self.type("input[name='password'], input[type='password']", self.password)
+
+        username_selectors = [
+            ("css", "input[name='email']"),
+            ("css", "input[type='email']"),
+            ("css", "input[name='username']"),
+            ("css", "input[id*='email' i]"),
+            ("xpath", "//input[@name='email']"),
+            ("xpath", "//input[@type='email']"),
+            ("xpath", "//input[contains(@placeholder, 'mail') or contains(@placeholder, 'Mail')]"),
+            ("xpath", "//input[contains(@placeholder, 'ser') or contains(@placeholder, 'ser')]"),
+        ]
+
+        username_found = False
+        for by, sel in username_selectors:
+            try:
+                if by == "css":
+                    self.wait_for_element_visible(sel, timeout=2)
+                    self.type(sel, self.username)
+                else:
+                    self.wait_for_element_visible(sel, by="xpath", timeout=2)
+                    self.type(sel, self.username, by="xpath")
+                print(f"  ✅ 用户名已输入（选择器: {sel}）")
+                username_found = True
+                break
+            except Exception:
+                continue
+
+        if not username_found:
+            print("  ⚠️ 常规选择器未命中，尝试 JS 兜底...")
+            inputs = self.driver.find_elements(By.TAG_NAME, "input")
+            for inp in inputs:
+                inp_type = (inp.get_attribute("type") or "").lower()
+                inp_name = (inp.get_attribute("name") or "").lower()
+                inp_id = (inp.get_attribute("id") or "").lower()
+                placeholder = (inp.get_attribute("placeholder") or "").lower()
+
+                if inp_type == "email" or "email" in inp_name or "email" in inp_id or "email" in placeholder or "username" in inp_name:
+                    self.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});"
+                        "arguments[0].focus();"
+                        "arguments[0].value = arguments[1];"
+                        "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                        inp, self.username
+                    )
+                    print("  ✅ 用户名已通过 JS 兜底填充")
+                    username_found = True
+                    break
+
+        if not username_found:
+            page_src = self.get_page_source()
+            print(f"  🔍 页面源码片段: {page_src[:2000]}")
+            raise Exception("❌ 无法找到用户名输入框")
+
+        password_selectors = [
+            ("css", "input[name='password']"),
+            ("css", "input[type='password']"),
+            ("xpath", "//input[@name='password']"),
+            ("xpath", "//input[@type='password']"),
+        ]
+
+        password_found = False
+        for by, sel in password_selectors:
+            try:
+                if by == "css":
+                    self.wait_for_element_visible(sel, timeout=2)
+                    self.type(sel, self.password)
+                else:
+                    self.wait_for_element_visible(sel, by="xpath", timeout=2)
+                    self.type(sel, self.password, by="xpath")
+                print(f"  ✅ 密码已输入（选择器: {sel}）")
+                password_found = True
+                break
+            except Exception:
+                continue
+
+        if not password_found:
+            print("  ⚠️ 常规选择器未命中，尝试 JS 兜底...")
+            inputs = self.driver.find_elements(By.TAG_NAME, "input")
+            for inp in inputs:
+                if (inp.get_attribute("type") or "").lower() == "password":
+                    self.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});"
+                        "arguments[0].focus();"
+                        "arguments[0].value = arguments[1];"
+                        "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                        inp, self.password
+                    )
+                    print("  ✅ 密码已通过 JS 兜底填充")
+                    password_found = True
+                    break
+
+        if not password_found:
+            raise Exception("❌ 无法找到密码输入框")
+
         print("✅ 用户名和密码已输入")
 
     def process_captcha(self, flow_name=""):
         """通用验证码处理（登录页 & 续期弹窗）"""
         print(f"🔄 开始处理 {flow_name} 人机验证...")
 
-        # 1. 点击复选框
         try:
             self.click("div.auth-captcha-checkbox, .captcha-checkbox, input[type='checkbox'] + label")
             self.sleep(1.5)
@@ -102,7 +209,6 @@ class TestAclRenewal(BaseCase):
             print(f"⚠️ 点击复选框失败: {e}")
             return False
 
-        # 2. 获取提示文字
         try:
             prompt_text = self.get_text("div.auth-captcha-prompt strong, .captcha-prompt strong")
             print(f"📝 验证码提示文字: {prompt_text}")
@@ -110,7 +216,6 @@ class TestAclRenewal(BaseCase):
             print(f"⚠️ 获取提示文字失败: {e}")
             return False
 
-        # 3. 获取选项
         try:
             options = self.driver.find_elements(
                 By.CSS_SELECTOR,
@@ -124,7 +229,6 @@ class TestAclRenewal(BaseCase):
             print("⚠️ 未找到验证码选项")
             return False
 
-        # 4. OCR 识别并点击
         target = prompt_text.lower().replace(" ", "").replace("-", "")
         clicked = False
 
@@ -157,7 +261,6 @@ class TestAclRenewal(BaseCase):
             print("❌ 未点击任何选项")
             return False
 
-        # 5. 验证结果
         self.sleep(2)
         try:
             if self.is_element_visible("span.auth-captcha-label, .captcha-label"):
@@ -180,9 +283,22 @@ class TestAclRenewal(BaseCase):
 
     def click_signin(self):
         print("👆 点击 Sign in 按钮...")
-        self.click("//button[contains(text(), 'Sign in')]")
-        self.sleep(2)
-        print("✅ 已点击 Sign in 按钮")
+        signin_selectors = [
+            "//button[contains(text(), 'Sign in')]",
+            "//button[contains(text(), 'Se connecter')]",
+            "//button[@type='submit']",
+            "button[type='submit']",
+        ]
+        for sel in signin_selectors:
+            try:
+                if self.is_element_visible(sel, timeout=2):
+                    self.click(sel)
+                    self.sleep(2)
+                    print("✅ 已点击 Sign in 按钮")
+                    return
+            except:
+                continue
+        raise Exception("❌ 未找到 Sign in 按钮")
 
     def check_login_success(self):
         current_url = self.get_current_url()
@@ -207,7 +323,7 @@ class TestAclRenewal(BaseCase):
 
         lang_btn = None
         for sel in lang_selectors:
-            if self.is_element_visible(sel):
+            if self.is_element_visible(sel, timeout=2):
                 lang_btn = sel
                 break
 
@@ -215,7 +331,6 @@ class TestAclRenewal(BaseCase):
             print("⚠️ 未找到语言切换按钮，跳过")
             return False
 
-        # 检查当前语言
         try:
             badge = self.find_element(f"{lang_btn} .lang-code-badge")
             if badge.text.strip().upper() == "EN":
@@ -228,7 +343,6 @@ class TestAclRenewal(BaseCase):
         self.click(lang_btn)
         self.sleep(1.5)
 
-        # 选择 English
         en_selectors = [
             "//button[.//img[contains(@src, 'en.png') or contains(@alt, 'English')]]",
             "//button[contains(text(), 'English')]",
@@ -237,7 +351,7 @@ class TestAclRenewal(BaseCase):
         ]
 
         for sel in en_selectors:
-            if self.is_element_visible(sel):
+            if self.is_element_visible(sel, timeout=2):
                 self.click(sel)
                 self.sleep(3)
                 print("✅ 已切换为 English")
@@ -253,7 +367,7 @@ class TestAclRenewal(BaseCase):
                 "//button[contains(text(), 'Close')]",
                 "//div[contains(@class, 'pwa-install')]//button[1]"
             ]:
-                if self.is_element_visible(sel):
+                if self.is_element_visible(sel, timeout=1):
                     self.click(sel)
                     print("✅ 已关闭安装弹窗")
                     self.sleep(0.5)
@@ -268,7 +382,7 @@ class TestAclRenewal(BaseCase):
 
         has_renewal = False
         try:
-            if self.is_element_visible("div.home-renewal-table, .renewal-table, [class*='renewal']"):
+            if self.is_element_visible("div.home-renewal-table, .renewal-table, [class*='renewal']", timeout=5):
                 renew_btns = self.driver.find_elements(
                     By.CSS_SELECTOR,
                     "button.home-renew-action, .renew-action, button[class*='renew']"
@@ -373,7 +487,7 @@ class TestAclRenewal(BaseCase):
             "//a[contains(@aria-label, 'My services')]",
             "//span[contains(text(), 'My services')]/parent::a"
         ]:
-            if self.is_element_visible(sel):
+            if self.is_element_visible(sel, timeout=2):
                 self.click(sel)
                 self.sleep(3)
                 print("✅ 已进入 My services 页面")
@@ -392,7 +506,7 @@ class TestAclRenewal(BaseCase):
             "//a[contains(text(), 'Manage')]",
             ".client-btn--primary"
         ]:
-            if self.is_element_visible(sel):
+            if self.is_element_visible(sel, timeout=2):
                 self.click(sel)
                 self.sleep(3)
                 print("✅ 已进入服务器详情页")
@@ -402,9 +516,6 @@ class TestAclRenewal(BaseCase):
         return False
 
     def get_server_info(self):
-        """
-        获取服务器详情页信息，并检测服务器状态（Online / Offline）
-        """
         print("\n📊 获取服务器信息...")
         info = {
             "time_remaining": "",
@@ -415,7 +526,6 @@ class TestAclRenewal(BaseCase):
             "server_url": self.get_current_url()
         }
 
-        # 1. 获取基础信息
         try:
             for sel in [
                 "div[style*='background: rgba(49, 95, 79']",
@@ -423,7 +533,7 @@ class TestAclRenewal(BaseCase):
                 ".server-info-card",
                 "[class*='server-info']"
             ]:
-                if self.is_element_visible(sel):
+                if self.is_element_visible(sel, timeout=2):
                     text = self.get_text(sel)
                     lines = [l.strip() for l in text.split('\n') if l.strip()]
                     for line in lines:
@@ -447,7 +557,6 @@ class TestAclRenewal(BaseCase):
         except Exception as e:
             print(f"❌ 获取服务器基础信息失败: {e}")
 
-        # 2. 检测服务器 Online / Offline 状态
         try:
             status_selectors = [
                 ".status-badge[data-status]",
@@ -458,7 +567,7 @@ class TestAclRenewal(BaseCase):
             ]
 
             for sel in status_selectors:
-                if self.is_element_visible(sel):
+                if self.is_element_visible(sel, timeout=2):
                     badge = self.find_element(sel)
                     data_status = badge.get_attribute("data-status") or ""
                     text_status = badge.text.strip() or ""
@@ -481,12 +590,6 @@ class TestAclRenewal(BaseCase):
         return info
 
     def handle_server_power(self):
-        """
-        根据服务器状态自动点击 Start 或 Restart 按钮。
-        - Offline → 点击 Start (data-variant="start")
-        - Online  → 点击 Restart (data-variant="restart")
-        返回: "start" / "restart" / None
-        """
         status = "unknown"
         try:
             badge = self.find_element(".status-badge[data-status], .status-badge")
@@ -506,15 +609,21 @@ class TestAclRenewal(BaseCase):
         if status == "offline":
             print("  🖥️ 服务器处于 Offline 状态，准备点击 Start...")
             start_selectors = [
-                "button.power-btn[data-variant='start']",
-                "button[data-variant='start']",
-                "//button[contains(@class, 'power-btn') and contains(., 'Start')]",
-                "//button[contains(@class, 'power-btn') and contains(., 'Démarrer')]"
+                ("css", "button.power-btn[data-variant='start']"),
+                ("css", "button[data-variant='start']"),
+                ("xpath", "//button[contains(@class, 'power-btn') and contains(., 'Start')]"),
+                ("xpath", "//button[contains(@class, 'power-btn') and contains(., 'Démarrer')]"),
             ]
 
-            for sel in start_selectors:
-                if self.is_element_visible(sel):
-                    btn = self.find_element(sel)
+            for by, sel in start_selectors:
+                try:
+                    if by == "css":
+                        self.wait_for_element_visible(sel, timeout=2)
+                        btn = self.find_element(sel)
+                    else:
+                        self.wait_for_element_visible(sel, by="xpath", timeout=2)
+                        btn = self.find_element(sel, by="xpath")
+
                     if btn.get_attribute("disabled"):
                         print("  ⚠️ Start 按钮处于 disabled 状态，跳过")
                         return None
@@ -525,6 +634,8 @@ class TestAclRenewal(BaseCase):
                     self.sleep(2)
                     print("  ✅ 已点击 Start 按钮")
                     return "start"
+                except:
+                    continue
 
             print("  ❌ 未找到 Start 按钮")
             return None
@@ -532,15 +643,21 @@ class TestAclRenewal(BaseCase):
         elif status == "online":
             print("  🖥️ 服务器处于 Online 状态，准备点击 Restart...")
             restart_selectors = [
-                "button.power-btn[data-variant='restart']",
-                "button[data-variant='restart']",
-                "//button[contains(@class, 'power-btn') and contains(., 'Restart')]",
-                "//button[contains(@class, 'power-btn') and contains(., 'Redémarrer')]"
+                ("css", "button.power-btn[data-variant='restart']"),
+                ("css", "button[data-variant='restart']"),
+                ("xpath", "//button[contains(@class, 'power-btn') and contains(., 'Restart')]"),
+                ("xpath", "//button[contains(@class, 'power-btn') and contains(., 'Redémarrer')]"),
             ]
 
-            for sel in restart_selectors:
-                if self.is_element_visible(sel):
-                    btn = self.find_element(sel)
+            for by, sel in restart_selectors:
+                try:
+                    if by == "css":
+                        self.wait_for_element_visible(sel, timeout=2)
+                        btn = self.find_element(sel)
+                    else:
+                        self.wait_for_element_visible(sel, by="xpath", timeout=2)
+                        btn = self.find_element(sel, by="xpath")
+
                     if btn.get_attribute("disabled"):
                         print("  ⚠️ Restart 按钮处于 disabled 状态，跳过")
                         return None
@@ -551,6 +668,8 @@ class TestAclRenewal(BaseCase):
                     self.sleep(2)
                     print("  ✅ 已点击 Restart 按钮")
                     return "restart"
+                except:
+                    continue
 
             print("  ❌ 未找到 Restart 按钮")
             return None
@@ -560,9 +679,6 @@ class TestAclRenewal(BaseCase):
             return None
 
     def send_notification(self, info, need_renewal, renewal_success, power_action):
-        """
-        power_action: None / "start" / "restart"
-        """
         if not self.webhook_key:
             print("⚠️ 未设置 WECHAT_WEBHOOK_KEY，跳过通知")
             return False
