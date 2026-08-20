@@ -295,7 +295,7 @@ def process_captcha(page, flow_name=""):
     return True
 
 
-def check_login_success(page, timeout=15):
+def check_login_success(page, timeout=30):
     """
     检测登录是否成功：轮询检测 URL 变化，最多等待 timeout 秒
     修复：避免只 sleep 一次就判断，导致误判为失败
