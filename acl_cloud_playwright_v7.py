@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.0）
-完整对齐原始 Selenium v6.1 逻辑：登录 → 语言切换 → 续期 → 导航 → 电源管理 → 通知
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.1）
+更新：语言切换改为弹窗式识别 + OCR 兜底
 """
 
 import os
@@ -462,9 +462,11 @@ def check_login_success(page, timeout=20):
     return False
 
 
-# ==================== 语言切换（完全对齐原始 Selenium）====================
+# ==================== 语言切换（弹窗式 + OCR 兜底）====================
 def switch_language_to_en(page):
     print("\n🌐 检查并切换语言为 English...")
+    
+    # 1. 定位语言切换按钮
     lang_button = None
     lang_selectors = [
         "button[aria-label='Langue']",
@@ -472,7 +474,8 @@ def switch_language_to_en(page):
         "button[class*='language']",
         "//button[@aria-label='Langue']",
         "//button[contains(@class, 'LanguageButton')]",
-        "//button[.//img[contains(@src, 'flags')]]"
+        "//button[.//img[contains(@src, 'flags')]]",
+        "//button[.//span[contains(@class, 'lang-code')]]",
     ]
 
     for sel in lang_selectors:
@@ -492,7 +495,7 @@ def switch_language_to_en(page):
         print("⚠️ 未找到语言切换按钮，跳过")
         return False
 
-    # 判断当前语言
+    # 2. 判断当前语言
     current_lang = ""
     try:
         badge = lang_button.locator(".lang-code-badge").first
@@ -514,23 +517,35 @@ def switch_language_to_en(page):
 
     print(f"📝 当前语言: {current_lang or '未知'}，准备切换为 English...")
 
-    # 点击展开语言下拉
+    # 3. 点击语言按钮，弹出语言选择弹窗
     lang_button.scroll_into_view_if_needed()
     time.sleep(0.3)
     lang_button.click()
-    print("✅ 已点击语言按钮，等待下拉菜单...")
+    print("✅ 已点击语言按钮，等待弹窗出现...")
     time.sleep(1.5)
 
-    # 选择 English
+    # 4. 在弹窗中查找 English 选项
     en_option = None
+    
+    # 4.1 先尝试通过文本/结构直接定位
     en_selectors = [
-        "//button[.//img[contains(@src, 'en.png') or contains(@alt, 'English')]]",
+        # 通过包含 EN 和 English 的按钮/行定位
+        "//button[.//span[text()='EN'] and .//span[contains(text(), 'English')]]",
+        "//div[contains(@class, 'modal')]//button[.//span[text()='EN'] and .//span[contains(text(), 'English')]]",
+        "//div[contains(@class, 'dialog')]//button[.//span[text()='EN'] and .//span[contains(text(), 'English')]]",
+        "//div[contains(@class, 'popup')]//button[.//span[text()='EN'] and .//span[contains(text(), 'English')]]",
+        # 通过 img alt 定位
+        "//button[.//img[contains(@alt, 'English') or contains(@src, 'en')]]",
+        "//div[contains(@class, 'modal')]//button[.//img[contains(@alt, 'English') or contains(@src, 'en')]]",
+        # 纯文本匹配
+        "button:has-text('English'):has-text('EN')",
         "//button[contains(text(), 'English')]",
-        "//button[.//span[contains(text(), 'EN')]]",
-        "//div[contains(@class, 'dropdown')]//button[.//img[contains(@src, 'en')]]",
-        "//div[contains(@class, 'menu')]//button[contains(., 'English')]",
-        "button[class*='LanguageOption'] img[src*='en']",
-        ".dropdown-menu button:has(img[src*='en'])"
+        # 通用弹窗内按钮
+        "div[role='dialog'] button",
+        "div[role='modal'] button",
+        ".language-modal button",
+        ".language-dialog button",
+        ".lang-modal button",
     ]
 
     for sel in en_selectors:
@@ -539,45 +554,164 @@ def switch_language_to_en(page):
                 loc = page.locator(f"xpath={sel}").first
             else:
                 loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=5000)
+            loc.wait_for(state="visible", timeout=3000)
             if loc.is_visible():
-                en_option = loc
-                break
+                # 验证是否真的是 English 选项
+                html = loc.inner_html().lower()
+                text = loc.inner_text().lower()
+                if "en" in text and "english" in text:
+                    en_option = loc
+                    print(f"✅ 直接定位到 English 选项: '{sel}'")
+                    break
         except:
             continue
 
+    # 4.2 兜底：遍历弹窗内所有可见按钮，用 OCR 识别
     if not en_option:
-        # 兜底：遍历下拉菜单
-        try:
-            dropdown = page.locator("//div[contains(@class, 'dropdown')] | //div[contains(@class, 'menu')] | //ul").first
-            buttons = dropdown.locator("button").all()
-            for btn in buttons:
-                btn_html = btn.inner_html() or ""
-                if "en" in btn_html.lower() or "english" in btn_html.lower():
-                    en_option = btn
-                    print("✅ 兜底找到 English 选项")
+        print("⚠️ 直接定位失败，尝试遍历弹窗内选项并用 OCR 识别...")
+        
+        # 先找到弹窗容器
+        modal_selectors = [
+            "div[role='dialog']",
+            "div[role='modal']",
+            ".language-modal",
+            ".language-dialog",
+            ".lang-modal",
+            "div[class*='modal']:visible",
+            "div[class*='dialog']:visible",
+            "div[class*='popup']:visible",
+        ]
+        
+        modal = None
+        for sel in modal_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=2000):
+                    modal = loc
+                    print(f"✅ 找到弹窗容器: '{sel}'")
                     break
-        except Exception as e:
-            print(f"❌ 兜底查找失败: {e}")
+            except:
+                continue
+        
+        if modal:
+            # 获取弹窗内所有按钮
+            try:
+                buttons = modal.locator("button").all()
+                print(f"📍 弹窗内共 {len(buttons)} 个按钮选项")
+                
+                for idx, btn in enumerate(buttons):
+                    try:
+                        if not btn.is_visible():
+                            continue
+                            
+                        btn_text = btn.inner_text().strip()
+                        btn_html = btn.inner_html().lower()
+                        print(f"     选项 {idx + 1}: '{btn_text}'")
+                        
+                        # 方法 A: 文本匹配
+                        text_lower = btn_text.lower()
+                        if ("en" in text_lower and "english" in text_lower) or \
+                           (btn_text.strip() == "EN" and "english" in btn_html):
+                            en_option = btn
+                            print(f"  ✅ 文本匹配到 English 选项 {idx + 1}")
+                            break
+                        
+                        # 方法 B: OCR 识别按钮内图片（如用户要求的 OCR 兜底）
+                        try:
+                            img = btn.locator("img").first
+                            if img.is_visible(timeout=500):
+                                src = img.get_attribute("src") or ""
+                                # 如果 src 包含 en/english 直接匹配
+                                if "en" in src.lower() or "english" in src.lower():
+                                    en_option = btn
+                                    print(f"  ✅ 图片 src 匹配到 English 选项 {idx + 1}: {src}")
+                                    break
+                                
+                                # 真正的 OCR：下载图片识别
+                                if src.startswith("http") or src.startswith("/"):
+                                    base_url = page.url.rstrip("/").rstrip("/auth/login")
+                                    full_url = src if src.startswith("http") else base_url + src
+                                    resp = requests.get(full_url, timeout=10)
+                                    img_obj = Image.open(BytesIO(resp.content)).convert("L")
+                                    img_obj = img_obj.point(lambda x: 255 if x > 128 else 0)
+                                    ocr_text = pytesseract.image_to_string(
+                                        img_obj, lang='eng', config='--psm 7'
+                                    ).strip().lower()
+                                    print(f"        OCR 结果: '{ocr_text}'")
+                                    if "en" in ocr_text or "english" in ocr_text or "british" in ocr_text:
+                                        en_option = btn
+                                        print(f"  ✅ OCR 匹配到 English 选项 {idx + 1}")
+                                        break
+                        except Exception as e:
+                            pass
+                            
+                    except Exception as e:
+                        print(f"     ❌ 选项 {idx + 1} 处理失败: {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"❌ 遍历弹窗选项失败: {e}")
+
+    # 4.3 最终兜底：全局搜索包含 English 的按钮
+    if not en_option:
+        print("⚠️ 弹窗内未找到，尝试全局搜索...")
+        try:
+            all_buttons = page.locator("button").all()
+            for btn in all_buttons:
+                try:
+                    if not btn.is_visible():
+                        continue
+                    text = btn.inner_text().lower()
+                    if "english" in text and "en" in text:
+                        en_option = btn
+                        print("✅ 全局搜索找到 English 选项")
+                        break
+                except:
+                    continue
+        except:
+            pass
 
     if not en_option:
         print("❌ 无法找到 English 选项，继续执行")
+        diagnostic_screenshot(page, "lang_switch_en_not_found")
         return False
 
+    # 5. 点击 English 选项
     en_option.scroll_into_view_if_needed()
     time.sleep(0.3)
     en_option.click()
-    print("✅ 已选择 English 语言")
+    print("✅ 已点击 English 语言选项")
     time.sleep(3)
 
-    # 验证
+    # 6. 验证切换结果
+    try:
+        # 等待弹窗消失
+        for _ in range(5):
+            if en_option.is_visible(timeout=500):
+                time.sleep(0.5)
+            else:
+                break
+    except:
+        pass
+
     try:
         badge = page.locator("button[class*='LanguageButton'] .lang-code-badge").first
-        if badge.inner_text().strip().upper() == "EN":
-            print("✅ 语言切换验证通过：EN")
+        if badge.is_visible(timeout=3000):
+            if badge.inner_text().strip().upper() == "EN":
+                print("✅ 语言切换验证通过：EN")
+                return True
+    except:
+        pass
+    
+    # 二次验证：检查页面是否有 English 特征文本
+    try:
+        body_text = page.locator("body").inner_text()
+        if "My services" in body_text or "Dashboard" in body_text:
+            print("✅ 语言切换验证通过（页面内容已英文）")
             return True
     except:
         pass
+        
     print("⚠️ 无法验证语言切换结果，继续执行")
     return True
 
@@ -1050,7 +1184,7 @@ def main():
                 send_wechat_notification({"server_name": "登录失败"}, False, False, "none")
                 return False
 
-            # ========== 登录成功后流程（完全对齐原始 Selenium）==========
+            # ========== 登录成功后流程 ==========
             print("\n✅ 登录成功，开始后续操作...")
             base_url = LOGIN_URL.rstrip("/auth/login").rstrip("/")
 
@@ -1062,7 +1196,7 @@ def main():
 
             close_install_popup(page)
 
-            # 语言切换
+            # 语言切换（弹窗式 + OCR 兜底）
             switch_language_to_en(page)
 
             # 再次确保在仪表盘
