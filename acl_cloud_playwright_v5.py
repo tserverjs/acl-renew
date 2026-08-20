@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 修复版 v4.0）
-修复：验证码识别逻辑完全对齐原始 Selenium 代码
+ACL Cloud 自动续期脚本（Playwright 修复版 v5.0）
+修复：登录成功检测改为轮询等待，避免误判
 特性：headless 原生录视频、无需 Xvfb、智能电源管理
 """
 
@@ -40,7 +40,6 @@ def ensure_video_dir():
 
 
 def diagnostic_screenshot(page, name):
-    """诊断截图"""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = f"{VIDEO_DIR}/{DIAGNOSTIC_PREFIX}_{ts}_{name}.png"
     try:
@@ -51,9 +50,7 @@ def diagnostic_screenshot(page, name):
 
 
 def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
-    """智能输入：等待元素可见 → 点击聚焦 → 清空 → 逐字符输入 → JS 兜底"""
     print(f"  🔍 查找 {label}...")
-
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -73,7 +70,6 @@ def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
         except Exception as e:
             print(f"     ❌ 选择器 '{sel}': {str(e)[:80]}")
             continue
-
     # JS 兜底
     print(f"  ⚠️ 常规输入失败，尝试 JavaScript 兜底...")
     for sel in selectors:
@@ -95,12 +91,10 @@ def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
         except Exception as e:
             print(f"     ❌ JS 兜底失败 '{sel}': {e}")
             continue
-
     return False
 
 
 def wait_and_click(page, selectors, label="按钮"):
-    """智能点击：等待可见后点击"""
     print(f"  🔍 查找 {label}...")
     for sel in selectors:
         try:
@@ -118,26 +112,18 @@ def wait_and_click(page, selectors, label="按钮"):
 
 
 def wait_for_login_page(page, url):
-    """等待登录页完全加载"""
     print(f"\n🌐 打开登录页: {url}")
-
     for attempt in range(3):
         try:
             page.goto(url, wait_until="networkidle", timeout=45000)
             print(f"  ✅ 页面 networkidle")
             time.sleep(3)
-
             selectors = [
-                "input[name='email']",
-                "input[type='email']",
-                "input[placeholder*='email' i]",
-                "input[name='username']",
-                "input[id*='email' i]",
-                "input[id='email']",
-                "input[autocomplete='username']",
-                "input[autocomplete='email']",
+                "input[name='email']", "input[type='email']",
+                "input[placeholder*='email' i]", "input[name='username']",
+                "input[id*='email' i]", "input[id='email']",
+                "input[autocomplete='username']", "input[autocomplete='email']",
             ]
-
             for sel in selectors:
                 try:
                     page.wait_for_selector(sel, state="visible", timeout=5000)
@@ -145,16 +131,13 @@ def wait_for_login_page(page, url):
                     return True
                 except:
                     continue
-
             print(f"  ⚠️ 第 {attempt+1} 次：表单未就绪，重试...")
             diagnostic_screenshot(page, f"login_retry_{attempt+1}")
             time.sleep(3)
-
         except Exception as e:
             print(f"  ❌ 第 {attempt+1} 次加载失败: {e}")
             diagnostic_screenshot(page, f"load_error_{attempt+1}")
             time.sleep(3)
-
     return False
 
 
@@ -162,7 +145,6 @@ def wait_for_login_page(page, url):
 # 🔄 验证码处理（完全对齐原始 Selenium 代码逻辑）
 # =============================================================================
 def process_captcha(page, flow_name=""):
-    """通用验证码处理，支持登录页和续期弹窗 —— 逻辑完全对齐原始 Selenium v6.0"""
     print(f"\n🔄 开始处理{flow_name}人机验证...")
 
     # ── 1. 点击复选框 ──────────────────────────────────────────────────────
@@ -171,8 +153,6 @@ def process_captcha(page, flow_name=""):
             "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"
         ).first
         checkbox.wait_for(state="visible", timeout=10000)
-
-        # 模拟人类：先移到元素上方，停顿，再点击
         checkbox.hover()
         time.sleep(0.3)
         checkbox.click()
@@ -216,16 +196,13 @@ def process_captcha(page, flow_name=""):
             img = btn.locator("img.auth-captcha-option-img, img").first
             src = img.get_attribute("src")
             full_url = base_url + src if src.startswith("/") else src
-
             print(f"     📍 选项 {idx + 1}: {full_url[:50]}...")
             resp = requests.get(full_url, timeout=10)
             img_obj = Image.open(BytesIO(resp.content)).convert("L")
             img_obj = img_obj.point(lambda x: 255 if x > 128 else 0)
             ocr_text = pytesseract.image_to_string(img_obj, lang='eng', config='--psm 7').strip()
-
             ocr_clean = ocr_text.lower().replace(" ", "").replace("-", "")
             print(f"        OCR 结果: '{ocr_text}' → 清洗后: '{ocr_clean}'")
-
             if target in ocr_clean or ocr_clean in target:
                 print(f"  ✅ 找到匹配: 选项 {idx + 1} (OCR: {ocr_text})")
                 btn.scroll_into_view_if_needed()
@@ -241,7 +218,7 @@ def process_captcha(page, flow_name=""):
         print("  ❌ 未点击任何选项")
         return False
 
-    # ── 5. 检查验证结果（完全对齐原始 Selenium 三种检测模式）───────────────
+    # ── 5. 检查验证结果（三种检测模式）──────────────────────────────────────
     time.sleep(2)
 
     # 模式 A：检测 Verified / Vérifié 标签
@@ -255,9 +232,8 @@ def process_captcha(page, flow_name=""):
     except:
         pass
 
-    # 模式 B：检测验证码元素是否消失（弹窗自动关闭的情况）
+    # 模式 B：检测验证码元素是否消失 + 错误提示
     try:
-        # 检查错误提示
         error_selectors = [
             ".auth-captcha-error", ".captcha-error", ".text-danger",
             "[class*='error']"
@@ -275,11 +251,9 @@ def process_captcha(page, flow_name=""):
                     break
             except:
                 continue
-
         if has_error:
             return False
 
-        # 验证码元素消失 = 验证通过（弹窗自动关闭）
         captcha_selectors = [
             "div.auth-captcha-options", ".captcha-options",
             "div.auth-captcha-prompt", ".auth-captcha-checkbox"
@@ -293,12 +267,10 @@ def process_captcha(page, flow_name=""):
                         visible_captcha += 1
             except:
                 continue
-
         if visible_captcha == 0:
             print("  ✅ 人机验证通过！(验证码元素已消失，弹窗自动关闭)")
             return True
 
-        # 检查成功提示
         success_selectors = [
             ".alert-success", ".text-success", ".success-message",
             "[class*='success']", "[class*='verified']", ".toast-success",
@@ -318,9 +290,42 @@ def process_captcha(page, flow_name=""):
     except Exception as e:
         print(f"  ⚠️ 验证结果检测异常: {e}")
 
-    # 模式 C：兜底 - 页面正常且无错误 = 通过
+    # 模式 C：兜底
     print("  ⚠️ 无法确认验证状态，假设通过（无错误提示）")
     return True
+
+
+def check_login_success(page, timeout=15):
+    """
+    检测登录是否成功：轮询检测 URL 变化，最多等待 timeout 秒
+    修复：避免只 sleep 一次就判断，导致误判为失败
+    """
+    print(f"  ⏳ 等待登录跳转（最多 {timeout} 秒）...")
+    start_time = time.time()
+    last_url = page.url
+
+    while time.time() - start_time < timeout:
+        current_url = page.url
+        # 如果 URL 变了且不含 login，说明登录成功
+        if "login" not in current_url.lower():
+            print(f"  🎉 登录成功！当前 URL: {current_url}")
+            return True
+        # 如果 URL 还在变化（还在跳转中），继续等待
+        if current_url != last_url:
+            print(f"  🔄 URL 变化中: {current_url}")
+            last_url = current_url
+            time.sleep(1)
+            continue
+        # URL 没变，再等 1 秒轮询
+        time.sleep(1)
+
+    # 超时后最终检查
+    final_url = page.url
+    print(f"  ⚠️ 登录检测超时，最终 URL: {final_url}")
+    if "login" not in final_url.lower():
+        print(f"  🎉 登录成功（最终确认）！URL: {final_url}")
+        return True
+    return False
 
 
 def needs_renewal(status_text):
@@ -526,14 +531,10 @@ def main():
             print("\n🔑 输入凭据...")
 
             email_ok = wait_and_type(page, [
-                "input[name='email']",
-                "input[type='email']",
-                "input[placeholder*='email' i]",
-                "input[name='username']",
-                "input[id*='email' i]",
-                "input[id='email']",
-                "input[autocomplete='username']",
-                "input[autocomplete='email']",
+                "input[name='email']", "input[type='email']",
+                "input[placeholder*='email' i]", "input[name='username']",
+                "input[id*='email' i]", "input[id='email']",
+                "input[autocomplete='username']", "input[autocomplete='email']",
             ], USERNAME, label="邮箱输入框", delay_ms=50)
 
             if not email_ok:
@@ -550,10 +551,8 @@ def main():
             time.sleep(0.5)
 
             pwd_ok = wait_and_type(page, [
-                "input[name='password']",
-                "input[type='password']",
-                "input[id='password']",
-                "input[autocomplete='current-password']",
+                "input[name='password']", "input[type='password']",
+                "input[id='password']", "input[autocomplete='current-password']",
             ], PASSWORD, label="密码输入框", delay_ms=50)
 
             if not pwd_ok:
@@ -565,7 +564,7 @@ def main():
             print("✅ 凭据已输入")
             time.sleep(1)
 
-            # 验证码 + 登录
+            # 验证码 + 登录（修复：使用轮询检测登录成功）
             login_ok = False
             for attempt in range(MAX_RETRIES):
                 print(f"\n🔄 验证码尝试 {attempt+1}/{MAX_RETRIES}")
@@ -576,11 +575,12 @@ def main():
                         "input[type='submit']",
                         "button:has-text('Connexion')",
                     ], label="Sign in 按钮"):
-                        time.sleep(4)
-                        if "login" not in page.url.lower():
-                            print(f"🎉 登录成功: {page.url}")
+                        # 🔧 修复：使用轮询检测，而不是固定 sleep 4 秒
+                        if check_login_success(page, timeout=15):
                             login_ok = True
                             break
+                        else:
+                            print(f"  ⚠️ 仍在登录页，准备重试...")
                 time.sleep(2)
 
             if not login_ok:
@@ -641,10 +641,8 @@ def main():
 
                 print("\n📂 导航到 My services...")
                 if not wait_and_click(page, [
-                    "a[aria-label='My services']",
-                    "a[href='/dashboard/projects']",
-                    "text=My services",
-                    "text=Mes services",
+                    "a[aria-label='My services']", "a[href='/dashboard/projects']",
+                    "text=My services", "text=Mes services",
                 ], label="My services"):
                     page.goto("https://aclclouds.com/dashboard/projects", wait_until="networkidle")
                 time.sleep(2)
@@ -664,10 +662,8 @@ def main():
             else:
                 print("\n📌 无需续期...")
                 if not wait_and_click(page, [
-                    "a[aria-label='My services']",
-                    "a[href='/dashboard/projects']",
-                    "text=My services",
-                    "text=Mes services",
+                    "a[aria-label='My services']", "a[href='/dashboard/projects']",
+                    "text=My services", "text=Mes services",
                 ], label="My services"):
                     page.goto("https://aclclouds.com/dashboard/projects", wait_until="networkidle")
                 time.sleep(2)
