@@ -1,9 +1,9 @@
 # =============================================================================
-# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright 版 v6）
-#    验证码逻辑完全对齐原始 Selenium 代码
+# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright + Xvfb + ffmpeg 完整录屏版）
+#    可录制完整浏览器 UI（地址栏、最大化/最小化/关闭按钮）
 # =============================================================================
 
-name: 🎬 ACL Cloud 自动续期 · Playwright
+name: 🎬 ACL Cloud 自动续期 · 完整浏览器录屏
 
 on:
   schedule:
@@ -19,18 +19,16 @@ on:
         options:
           - '1920x1080'
           - '1280x720'
-          - '854x480'
 
 env:
   ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
   ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
   ACL_LOGIN_URL: ${{ vars.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
   WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
-  VIDEO_SIZE: ${{ github.event.inputs.video_size || '1280x720' }}
 
 jobs:
   auto-renewal:
-    name: 🎭 Playwright 自动化执行
+    name: 🎭 完整浏览器录屏自动化
     runs-on: ubuntu-latest
     timeout-minutes: 8
 
@@ -38,7 +36,7 @@ jobs:
       - name: 📥 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 🐧 安装系统依赖（加速版）
+      - name: 🐧 安装系统依赖（Xvfb / ffmpeg / Tesseract / 字体）
         run: |
           echo "⚡ 启用 apt 加速模式..."
           sudo apt-get update -qq -o Acquire::Retries=3
@@ -46,12 +44,15 @@ jobs:
           
           echo "⏳ 正在安装依赖包（eatmydata 加速中）..."
           sudo eatmydata apt-get install -y -qq -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 \
+            xvfb \
+            ffmpeg \
             tesseract-ocr \
             tesseract-ocr-eng \
             tesseract-ocr-fra \
-            ffmpeg \
             fonts-noto-cjk \
-            fonts-wqy-zenhei
+            fonts-wqy-zenhei \
+            libgl1-mesa-glx \
+            libglib2.0-0
           echo "✅ 系统依赖安装完成"
 
       - name: 🐍 配置 Python 3.11
@@ -73,6 +74,10 @@ jobs:
           echo "┌──────────────────────────────────────────┐"
           echo "│           🔍 环境验证报告                 │"
           echo "├──────────────────────────────────────────┤"
+          echo -n "│ Xvfb          "
+          xvfb-run --auto-servernum -- echo "✅ 正常" || echo "❌ 异常"
+          echo -n "│ ffmpeg        "
+          ffmpeg -version 2>/dev/null | head -1 | awk '{print "✅ " $3}' || echo "❌ 异常"
           echo -n "│ Python        "
           python3 --version | awk '{print "✅ " $2}'
           echo -n "│ Playwright    "
@@ -81,11 +86,9 @@ jobs:
           python3 -c "from playwright.sync_api import sync_playwright as sp; p=sp().__enter__(); b=p.chromium.launch(headless=True); print('✅ Headless 启动正常'); b.close(); p.stop()"
           echo -n "│ Tesseract     "
           tesseract --version 2>/dev/null | head -1 | awk '{print "✅ " $4}' || echo "❌ 异常"
-          echo -n "│ ffmpeg        "
-          ffmpeg -version 2>/dev/null | head -1 | awk '{print "✅ " $3}' || echo "❌ 异常"
           echo "└──────────────────────────────────────────┘"
 
-      - name: 🤖 执行 Playwright 自动化脚本（v5 验证码修复版）
+      - name: 🤖 执行自动化脚本（v6 完整浏览器录屏版）
         run: |
           mkdir -p videos
           echo "🚀 脚本启动中..."
@@ -94,30 +97,20 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
 
-      - name: 🔄 转换视频为 MP4
-        if: always()
-        run: |
-          for f in videos/*.webm; do
-            [ -f "$f" ] || continue
-            out="${f%.webm}.mp4"
-            echo "🔄 转换: $(basename $f) → $(basename $out)"
-            ffmpeg -i "$f" -c:v libx264 -preset fast -crf 28 -pix_fmt yuv420p -movflags +faststart -y "$out" 2>/dev/null
-          done
-          echo "✅ 视频转换完成"
-
-      - name: 🎬 上传屏幕录屏
+      - name: 🎬 上传屏幕录屏（完整浏览器 UI）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 🎥-录屏-${{ github.run_id }}-${{ github.run_attempt }}
+          name: 🎥-完整浏览器录屏-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            videos/*.webm
-            videos/*.mp4
+            full_operation_recording.mp4
+            videos/*.png
           retention-days: 3
           if-no-files-found: warn
 
       - name: 🧹 清理临时文件
         if: always()
         run: |
+          rm -f full_operation_recording.mp4
           rm -rf videos/
           echo "🧹 清理完成"
