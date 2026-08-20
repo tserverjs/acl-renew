@@ -1,68 +1,123 @@
-name: ACL Cloud Auto (Playwright + Standard Sources)
+# =============================================================================
+# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright 版 v4）
+#    验证码逻辑完全对齐原始 Selenium 代码
+# =============================================================================
+
+name: 🎬 ACL Cloud 自动续期 · Playwright
 
 on:
   schedule:
     - cron: '0 2 * * *'
+
   workflow_dispatch:
+    inputs:
+      video_size:
+        description: '📐 录屏分辨率'
+        required: false
+        default: '1920x1080'
+        type: choice
+        options:
+          - '1920x1080'
+          - '1280x720'
+          - '854x480'
 
 env:
   ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
   ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
   ACL_LOGIN_URL: ${{ vars.ACL_LOGIN_URL || 'https://aclclouds.com/auth/login' }}
   WECHAT_WEBHOOK_KEY: ${{ secrets.WECHAT_WEBHOOK_KEY }}
+  VIDEO_SIZE: ${{ github.event.inputs.video_size || '1280x720' }}
 
 jobs:
   auto-renewal:
+    name: 🎭 Playwright 自动化执行
     runs-on: ubuntu-latest
     timeout-minutes: 8
 
     steps:
-      - name: Checkout code
+      - name: 📥 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 🐧 安装系统依赖（加速版）
+        run: |
+          echo "⚡ 启用 apt 加速模式..."
+          sudo apt-get update -qq -o Acquire::Retries=3
+          sudo apt-get install -y -qq -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 eatmydata
+          
+          echo "⏳ 正在安装依赖包（eatmydata 加速中）..."
+          sudo eatmydata apt-get install -y -qq -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            tesseract-ocr-fra \
+            ffmpeg \
+            fonts-noto-cjk \
+            fonts-wqy-zenhei
+          echo "✅ 系统依赖安装完成"
+
+      - name: 🐍 配置 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      # 1. 替换 Apt 源为阿里云镜像
-      - name: Change Apt Mirrors
+      - name: 📦 安装 Python 依赖 & Playwright Chromium
         run: |
-          sudo sed -i 's/azure.archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
-          sudo sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
-          sudo sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
+          pip install -q --upgrade pip
+          pip install -q playwright pillow pytesseract requests
+          echo "⏳ 下载 Chromium..."
+          playwright install chromium
+          echo "✅ Playwright + Chromium 就绪"
 
-      - name: Install dependencies
+      - name: 🔍 验证运行环境
         run: |
-          sudo apt-get update -o Acquire::http::Timeout="15"
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends \
-            tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra \
-            fonts-noto-cjk fonts-wqy-zenhei
+          echo "┌──────────────────────────────────────────┐"
+          echo "│           🔍 环境验证报告                 │"
+          echo "├──────────────────────────────────────────┤"
+          echo -n "│ Python        "
+          python3 --version | awk '{print "✅ " $2}'
+          echo -n "│ Playwright    "
+          python3 -c "from playwright.sync_api import sync_playwright; print('✅ 已安装')"
+          echo -n "│ Chromium      "
+          python3 -c "from playwright.sync_api import sync_playwright as sp; p=sp().__enter__(); b=p.chromium.launch(headless=True); print('✅ Headless 启动正常'); b.close(); p.stop()"
+          echo -n "│ Tesseract     "
+          tesseract --version 2>/dev/null | head -1 | awk '{print "✅ " $4}' || echo "❌ 异常"
+          echo -n "│ ffmpeg        "
+          ffmpeg -version 2>/dev/null | head -1 | awk '{print "✅ " $3}' || echo "❌ 异常"
+          echo "└──────────────────────────────────────────┘"
 
-          # 2. 替换 PyPI 源为清华镜像安装 Python 库
-          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --upgrade pip
-          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple playwright pillow pytesseract requests
-
-          # 3. 安装 Chromium 浏览器及其系统依赖 (内置源)
-          playwright install --with-deps chromium
-          echo "✅ 依赖与浏览器安装完成"
-
-      - name: Verify Playwright
-        run: |
-          python -c "from playwright.sync_api import sync_playwright; print('Playwright OK')"
-          python -c "from playwright.sync_api import sync_playwright as sp; p=sp().__enter__(); b=p.chromium.launch(headless=True); print('Chromium headless launch OK'); b.close(); p.stop()"
-
-      - name: Run automation
+      - name: 🤖 执行 Playwright 自动化脚本（v4 验证码修复版）
         run: |
           mkdir -p videos
-          python3 acl_renewal.py
+          echo "🚀 脚本启动中..."
+          python3 acl_cloud_playwright_v4.py
+          echo "🏁 脚本执行完毕"
         env:
           PYTHONUNBUFFERED: "1"
 
-      - name: Upload video
+      - name: 🔄 转换视频为 MP4
+        if: always()
+        run: |
+          for f in videos/*.webm; do
+            [ -f "$f" ] || continue
+            out="${f%.webm}.mp4"
+            echo "🔄 转换: $(basename $f) → $(basename $out)"
+            ffmpeg -i "$f" -c:v libx264 -preset fast -crf 28 -pix_fmt yuv420p -movflags +faststart -y "$out" 2>/dev/null
+          done
+          echo "✅ 视频转换完成"
+
+      - name: 🎬 上传屏幕录屏
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screen-recording-${{ github.run_id }}-${{ github.run_attempt }}
-          path: videos/
+          name: 🎥-录屏-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            videos/*.webm
+            videos/*.mp4
           retention-days: 3
+          if-no-files-found: warn
+
+      - name: 🧹 清理临时文件
+        if: always()
+        run: |
+          rm -rf videos/
+          echo "🧹 清理完成"
