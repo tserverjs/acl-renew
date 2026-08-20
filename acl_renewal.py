@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 修复版 v3.0）
-修复：输入框等待 + 逐字符输入模拟 + JS 兜底
+ACL Cloud 自动续期脚本（Playwright 修复版 v4.0）
+修复：验证码识别逻辑完全对齐原始 Selenium 代码
 特性：headless 原生录视频、无需 Xvfb、智能电源管理
 """
 
@@ -51,33 +51,22 @@ def diagnostic_screenshot(page, name):
 
 
 def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
-    """
-    智能输入：等待元素可见 → 清空 → 逐字符输入（模拟真实键盘）
-    如果 type 失败，用 JavaScript 兜底设置 value
-    """
+    """智能输入：等待元素可见 → 点击聚焦 → 清空 → 逐字符输入 → JS 兜底"""
     print(f"  🔍 查找 {label}...")
 
     for sel in selectors:
         try:
             loc = page.locator(sel).first
-            # 步骤 1：等待元素可见（最多 8 秒）
             loc.wait_for(state="visible", timeout=8000)
             print(f"     ✅ 找到 {label}: '{sel}'")
-
-            # 步骤 2：点击聚焦（确保元素获得焦点）
             loc.click(timeout=5000)
             time.sleep(0.2)
-
-            # 步骤 3：清空现有内容（Ctrl+A + Delete）
             loc.press("Control+a")
             loc.press("Delete")
             time.sleep(0.2)
-
-            # 步骤 4：逐字符输入（模拟真实键盘，触发所有 JS 事件）
             loc.type(value, delay=delay_ms, timeout=15000)
-            print(f"     ✅ {label} 输入完成（逐字符模拟）")
+            print(f"     ✅ {label} 输入完成")
             return True
-
         except PlaywrightTimeout:
             print(f"     ⏱️ 选择器 '{sel}' 等待超时")
             continue
@@ -85,14 +74,11 @@ def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
             print(f"     ❌ 选择器 '{sel}': {str(e)[:80]}")
             continue
 
-    # 兜底方案：用 JavaScript 直接设置 value 并触发事件
+    # JS 兜底
     print(f"  ⚠️ 常规输入失败，尝试 JavaScript 兜底...")
     for sel in selectors:
         try:
-            # 先等元素出现在 DOM 中
             page.wait_for_selector(sel, state="attached", timeout=5000)
-
-            # 用 JS 设置 value 并触发 input/change 事件
             page.evaluate(f"""
                 (() => {{
                     const el = document.querySelector('{sel}');
@@ -120,7 +106,6 @@ def wait_and_click(page, selectors, label="按钮"):
         try:
             loc = page.locator(sel).first
             loc.wait_for(state="visible", timeout=8000)
-            # 滚动到视野内
             loc.scroll_into_view_if_needed()
             time.sleep(0.3)
             loc.click(timeout=5000)
@@ -140,11 +125,8 @@ def wait_for_login_page(page, url):
         try:
             page.goto(url, wait_until="networkidle", timeout=45000)
             print(f"  ✅ 页面 networkidle")
-
-            # 额外等待 JS 渲染
             time.sleep(3)
 
-            # 检查关键元素
             selectors = [
                 "input[name='email']",
                 "input[type='email']",
@@ -176,55 +158,76 @@ def wait_for_login_page(page, url):
     return False
 
 
+# =============================================================================
+# 🔄 验证码处理（完全对齐原始 Selenium 代码逻辑）
+# =============================================================================
 def process_captcha(page, flow_name=""):
-    """处理人机验证"""
-    print(f"\n🔄 {flow_name} 人机验证...")
+    """通用验证码处理，支持登录页和续期弹窗 —— 逻辑完全对齐原始 Selenium v6.0"""
+    print(f"\n🔄 开始处理{flow_name}人机验证...")
 
+    # ── 1. 点击复选框 ──────────────────────────────────────────────────────
     try:
-        checkbox = page.locator("div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox").first
+        checkbox = page.locator(
+            "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"
+        ).first
         checkbox.wait_for(state="visible", timeout=10000)
+
+        # 模拟人类：先移到元素上方，停顿，再点击
+        checkbox.hover()
+        time.sleep(0.3)
         checkbox.click()
         time.sleep(1.5)
         print("  ✅ 复选框已点击")
     except Exception as e:
-        print(f"  ⚠️ 复选框: {e}")
+        print(f"  ⚠️ 点击复选框失败: {e}")
         return False
 
+    # ── 2. 获取提示文字 ────────────────────────────────────────────────────
     try:
         prompt = page.locator("div.auth-captcha-prompt, .captcha-prompt").first
         prompt.wait_for(state="visible", timeout=5000)
         strong_text = prompt.locator("strong").inner_text()
-        print(f"  📝 提示: {strong_text}")
+        print(f"  📝 验证码提示文字: {strong_text}")
     except Exception as e:
-        print(f"  ⚠️ 获取提示: {e}")
+        print(f"  ⚠️ 获取提示文字失败: {e}")
         return False
 
+    # ── 3. 获取选项 ─────────────────────────────────────────────────────────
     try:
-        options = page.locator("div.auth-captcha-options button, .captcha-options .captcha-option").all()
+        options = page.locator(
+            "div.auth-captcha-options button, .captcha-options .captcha-option, "
+            "button.auth-captcha-option, .captcha-option"
+        ).all()
         if not options:
-            print("  ⚠️ 未找到选项")
+            print("  ⚠️ 获取选项失败: 未找到选项按钮")
             return False
-        print(f"  📍 {len(options)} 个选项")
+        print(f"  📍 共 {len(options)} 个选项")
     except Exception as e:
-        print(f"  ⚠️ 获取选项: {e}")
+        print(f"  ⚠️ 获取选项失败: {e}")
         return False
 
-    target = strong_text.lower().replace(" ", "").replace("-", "")
+    # ── 4. OCR 识别并点击 ──────────────────────────────────────────────────
     base_url = page.url.rstrip("/auth/login").rstrip("/")
+    target = strong_text.lower().replace(" ", "").replace("-", "")
     clicked = False
 
     for idx, btn in enumerate(options):
         try:
-            img = btn.locator("img").first
+            img = btn.locator("img.auth-captcha-option-img, img").first
             src = img.get_attribute("src")
             full_url = base_url + src if src.startswith("/") else src
+
+            print(f"     📍 选项 {idx + 1}: {full_url[:50]}...")
             resp = requests.get(full_url, timeout=10)
             img_obj = Image.open(BytesIO(resp.content)).convert("L")
             img_obj = img_obj.point(lambda x: 255 if x > 128 else 0)
-            ocr = pytesseract.image_to_string(img_obj, lang='eng', config='--psm 7').strip()
-            ocr_clean = ocr.lower().replace(" ", "").replace("-", "")
+            ocr_text = pytesseract.image_to_string(img_obj, lang='eng', config='--psm 7').strip()
+
+            ocr_clean = ocr_text.lower().replace(" ", "").replace("-", "")
+            print(f"        OCR 结果: '{ocr_text}' → 清洗后: '{ocr_clean}'")
+
             if target in ocr_clean or ocr_clean in target:
-                print(f"  ✅ 匹配选项 {idx+1} (OCR: {ocr})")
+                print(f"  ✅ 找到匹配: 选项 {idx + 1} (OCR: {ocr_text})")
                 btn.scroll_into_view_if_needed()
                 time.sleep(0.3)
                 btn.click()
@@ -232,27 +235,91 @@ def process_captcha(page, flow_name=""):
                 time.sleep(2)
                 break
         except Exception as e:
-            print(f"     ❌ 选项 {idx+1}: {e}")
+            print(f"     ❌ 选项 {idx + 1} 识别失败: {e}")
 
     if not clicked:
-        print("  ❌ 未匹配")
+        print("  ❌ 未点击任何选项")
         return False
 
+    # ── 5. 检查验证结果（完全对齐原始 Selenium 三种检测模式）───────────────
     time.sleep(2)
+
+    # 模式 A：检测 Verified / Vérifié 标签
     try:
         verified = page.locator("span.auth-captcha-label, .captcha-label").first
-        if verified.is_visible() and ("Verified" in verified.inner_text() or "Vérifié" in verified.inner_text()):
-            print("  ✅ 验证通过")
-            return True
+        if verified.is_visible():
+            vtext = verified.inner_text()
+            if "Verified" in vtext or "Vérifié" in vtext:
+                print(f"  ✅ 人机验证通过！(Verified 标签: {vtext})")
+                return True
     except:
         pass
+
+    # 模式 B：检测验证码元素是否消失（弹窗自动关闭的情况）
     try:
-        if not page.locator("div.auth-captcha-options, .captcha-options").first.is_visible():
-            print("  ✅ 验证通过（弹窗关闭）")
+        # 检查错误提示
+        error_selectors = [
+            ".auth-captcha-error", ".captcha-error", ".text-danger",
+            "[class*='error']"
+        ]
+        has_error = False
+        for sel in error_selectors:
+            try:
+                els = page.locator(sel).all()
+                for el in els:
+                    if el.is_visible() and el.inner_text().strip():
+                        print(f"  ❌ 人机验证失败（检测到错误提示: {el.inner_text().strip()[:50]}）")
+                        has_error = True
+                        break
+                if has_error:
+                    break
+            except:
+                continue
+
+        if has_error:
+            return False
+
+        # 验证码元素消失 = 验证通过（弹窗自动关闭）
+        captcha_selectors = [
+            "div.auth-captcha-options", ".captcha-options",
+            "div.auth-captcha-prompt", ".auth-captcha-checkbox"
+        ]
+        visible_captcha = 0
+        for sel in captcha_selectors:
+            try:
+                els = page.locator(sel).all()
+                for el in els:
+                    if el.is_visible():
+                        visible_captcha += 1
+            except:
+                continue
+
+        if visible_captcha == 0:
+            print("  ✅ 人机验证通过！(验证码元素已消失，弹窗自动关闭)")
             return True
-    except:
-        pass
-    print("  ⚠️ 假设通过")
+
+        # 检查成功提示
+        success_selectors = [
+            ".alert-success", ".text-success", ".success-message",
+            "[class*='success']", "[class*='verified']", ".toast-success",
+            ".notification-success"
+        ]
+        for sel in success_selectors:
+            try:
+                els = page.locator(sel).all()
+                for el in els:
+                    if el.is_visible():
+                        txt = el.inner_text().strip()
+                        if txt:
+                            print(f"  ✅ 人机验证通过！(成功提示: {txt[:30]})")
+                            return True
+            except:
+                continue
+    except Exception as e:
+        print(f"  ⚠️ 验证结果检测异常: {e}")
+
+    # 模式 C：兜底 - 页面正常且无错误 = 通过
+    print("  ⚠️ 无法确认验证状态，假设通过（无错误提示）")
     return True
 
 
@@ -280,14 +347,14 @@ def get_server_info(page):
             raw = ds or txt
             if any(w in raw for w in ["online", "en ligne", "actif"]):
                 info["status"] = SERVER_STATUS = "online"
-                print(f"  🟢 Online")
+                print(f"  🟢 Online (data-status={ds}, text={txt})")
             elif any(w in raw for w in ["offline", "hors ligne", "inactif"]):
                 info["status"] = SERVER_STATUS = "offline"
-                print(f"  🔴 Offline")
+                print(f"  🔴 Offline (data-status={ds}, text={txt})")
             else:
-                print(f"  ⚪ 未知: {txt}")
+                print(f"  ⚪ 未知: {txt} (data-status={ds})")
     except Exception as e:
-        print(f"  ⚠️ 状态: {e}")
+        print(f"  ⚠️ 状态检测失败: {e}")
 
     try:
         container = page.locator("div[style*='background: rgba(49, 95, 79'], .server-info-card, [class*='server-info']").first
@@ -458,7 +525,6 @@ def main():
 
             print("\n🔑 输入凭据...")
 
-            # 邮箱输入（逐字符模拟 + JS 兜底）
             email_ok = wait_and_type(page, [
                 "input[name='email']",
                 "input[type='email']",
@@ -473,7 +539,6 @@ def main():
             if not email_ok:
                 print("❌ 无法输入邮箱")
                 diagnostic_screenshot(page, "email_input_failed")
-                # 打印页面源码帮助排查
                 try:
                     html = page.content()
                     print(f"\n📄 页面源码前 3000 字符:\n{html[:3000]}")
@@ -484,7 +549,6 @@ def main():
 
             time.sleep(0.5)
 
-            # 密码输入
             pwd_ok = wait_and_type(page, [
                 "input[name='password']",
                 "input[type='password']",
