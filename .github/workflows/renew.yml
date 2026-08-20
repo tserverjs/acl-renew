@@ -1,5 +1,5 @@
 # =============================================================================
-# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright 版 v5）
+# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright 版 v6）
 #    验证码逻辑完全对齐原始 Selenium 代码
 # =============================================================================
 
@@ -89,7 +89,7 @@ jobs:
         run: |
           mkdir -p videos
           echo "🚀 脚本启动中..."
-          python3 acl_cloud_playwright_v5.py
+          python3 acl_cloud_playwright_v6.py
           echo "🏁 脚本执行完毕"
         env:
           PYTHONUNBUFFERED: "1"
