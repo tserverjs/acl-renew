@@ -977,40 +977,32 @@ def manage_server_power(page):
     global POWER_ACTION, SERVER_UPTIME
     print("\n⚡ 检测服务器电源状态并执行操作...")
 
+    # 优先使用 get_server_info() 已获取的 SERVER_UPTIME
     has_uptime = False
-    uptime_value = ""
+    uptime_value = SERVER_UPTIME
 
-    try:
-        stat_items = page.locator("div.stat-item").all()
-        for item in stat_items:
-            try:
-                label = item.locator(".stat-label").first.inner_text(timeout=1000).strip()
-                if "Status" in label or "Uptime" in label:
-                    value = item.locator(".stat-value").first.inner_text(timeout=1000).strip()
-                    if value and any(c in value for c in ["h", "m", "s", "d"]):
-                        has_uptime = True
-                        uptime_value = value
-                        SERVER_UPTIME = value
-                        print(f"  📊 检测到运行时间: {value} → Online")
-                    break
-            except:
-                continue
-    except Exception as e:
-        print(f"  ⚠️ stat-item 检测失败: {e}")
-
-    if not has_uptime:
+    if uptime_value and any(c in uptime_value for c in ["h", "m", "s", "d"]):
+        has_uptime = True
+        print(f"  📊 使用已获取的运行时间: {uptime_value} → Online")
+    else:
+        # 兜底：重新从页面获取
         try:
-            badge = page.locator("span.status-badge[data-status], .status-badge, [class*='status-badge']").first
-            if badge.is_visible(timeout=3000):
-                ds = (badge.get_attribute("data-status") or "").lower()
-                txt = badge.inner_text().strip().lower()
-                print(f"  📊 状态徽章: data-status={ds}, text={txt}")
-                if any(w in (ds + txt) for w in ["offline", "hors ligne", "inactif", "stopped"]):
-                    print(f"  🔴 状态徽章显示 Offline")
-                else:
-                    print(f"  ⚠️ 状态徽章未明确显示 Offline，尝试获取 Uptime...")
+            stat_items = page.locator("div.stat-item").all()
+            for item in stat_items:
+                try:
+                    label = item.locator(".stat-label").first.inner_text(timeout=1000).strip()
+                    if "Status" in label or "Uptime" in label:
+                        value = item.locator(".stat-value").first.inner_text(timeout=1000).strip()
+                        if value and any(c in value for c in ["h", "m", "s", "d"]):
+                            has_uptime = True
+                            uptime_value = value
+                            SERVER_UPTIME = value
+                            print(f"  📊 检测到运行时间: {value} → Online")
+                        break
+                except:
+                    continue
         except Exception as e:
-            print(f"  ⚠️ status-badge 检测失败: {e}")
+            print(f"  ⚠️ stat-item 检测失败: {e}")
 
     if not has_uptime:
         print("🔴 未检测到运行时间，服务器可能 Offline，执行 Start...")
