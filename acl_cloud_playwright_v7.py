@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.2）
-更新：
-  1. 语言切换改为弹窗式识别 + OCR 兜底
-  2. 服务器信息获取对齐原始 Selenium v6.1 逻辑
-  3. 电源管理：Online 时获取 Uptime 不重启，Offline 时执行 Start
-  4. 企业微信通知增加 Uptime 字段
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.2-fix）
 """
 
 import os
@@ -39,7 +34,7 @@ NEED_RENEWAL = False
 RENEWAL_SUCCESS = False
 SERVER_STATUS = "unknown"
 POWER_ACTION = "none"
-SERVER_UPTIME = ""  # 新增：服务器运行时间
+SERVER_UPTIME = ""
 
 _xvfb_proc = None
 _ffmpeg_proc = None
@@ -156,7 +151,6 @@ def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
         except Exception as e:
             print(f"     ❌ 选择器 '{sel}': {str(e)[:80]}")
             continue
-    # JS 兜底
     print(f"  ⚠️ 常规输入失败，尝试 JavaScript 兜底...")
     for sel in selectors:
         try:
@@ -233,8 +227,7 @@ def close_install_popup(page):
 
 
 def wait_for_login_page(page, url):
-    print(f"
-🌐 打开登录页: {url}")
+    print(f"\n🌐 打开登录页: {url}")
     for attempt in range(3):
         try:
             page.goto(url, wait_until="networkidle", timeout=45000)
@@ -264,8 +257,7 @@ def wait_for_login_page(page, url):
 
 
 def process_captcha(page, flow_name=""):
-    print(f"
-🔄 开始处理{flow_name}人机验证...")
+    print(f"\n🔄 开始处理{flow_name}人机验证...")
 
     # 1. 点击复选框
     try:
@@ -468,12 +460,9 @@ def check_login_success(page, timeout=20):
     return False
 
 
-# ==================== 语言切换（弹窗式 + OCR 兜底）====================
 def switch_language_to_en(page):
-    print("
-🌐 检查并切换语言为 English...")
-
-    # 1. 定位语言切换按钮
+    print("\n🌐 检查并切换语言为 English...")
+    
     lang_button = None
     lang_selectors = [
         "button[aria-label='Langue']",
@@ -502,7 +491,6 @@ def switch_language_to_en(page):
         print("⚠️ 未找到语言切换按钮，跳过")
         return False
 
-    # 2. 判断当前语言
     current_lang = ""
     try:
         badge = lang_button.locator(".lang-code-badge").first
@@ -524,17 +512,14 @@ def switch_language_to_en(page):
 
     print(f"📝 当前语言: {current_lang or '未知'}，准备切换为 English...")
 
-    # 3. 点击语言按钮，弹出语言选择弹窗
     lang_button.scroll_into_view_if_needed()
     time.sleep(0.3)
     lang_button.click()
     print("✅ 已点击语言按钮，等待弹窗出现...")
     time.sleep(1.5)
 
-    # 4. 在弹窗中查找 English 选项
     en_option = None
-
-    # 4.1 先尝试通过文本/结构直接定位
+    
     en_selectors = [
         "//button[.//span[text()='EN'] and .//span[contains(text(), 'English')]]",
         "//div[contains(@class, 'modal')]//button[.//span[text()='EN'] and .//span[contains(text(), 'English')]]",
@@ -568,10 +553,9 @@ def switch_language_to_en(page):
         except:
             continue
 
-    # 4.2 兜底：遍历弹窗内所有可见按钮，用 OCR 识别
     if not en_option:
         print("⚠️ 直接定位失败，尝试遍历弹窗内选项并用 OCR 识别...")
-
+        
         modal_selectors = [
             "div[role='dialog']",
             "div[role='modal']",
@@ -582,7 +566,7 @@ def switch_language_to_en(page):
             "div[class*='dialog']:visible",
             "div[class*='popup']:visible",
         ]
-
+        
         modal = None
         for sel in modal_selectors:
             try:
@@ -593,27 +577,28 @@ def switch_language_to_en(page):
                     break
             except:
                 continue
-
+        
         if modal:
             try:
                 buttons = modal.locator("button").all()
                 print(f"📍 弹窗内共 {len(buttons)} 个按钮选项")
-
+                
                 for idx, btn in enumerate(buttons):
                     try:
                         if not btn.is_visible():
                             continue
-
+                            
                         btn_text = btn.inner_text().strip()
                         btn_html = btn.inner_html().lower()
                         print(f"     选项 {idx + 1}: '{btn_text}'")
-
+                        
                         text_lower = btn_text.lower()
-                        if ("en" in text_lower and "english" in text_lower) or                            (btn_text.strip() == "EN" and "english" in btn_html):
+                        if ("en" in text_lower and "english" in text_lower) or \
+                           (btn_text.strip() == "EN" and "english" in btn_html):
                             en_option = btn
                             print(f"  ✅ 文本匹配到 English 选项 {idx + 1}")
                             break
-
+                        
                         try:
                             img = btn.locator("img").first
                             if img.is_visible(timeout=500):
@@ -622,7 +607,7 @@ def switch_language_to_en(page):
                                     en_option = btn
                                     print(f"  ✅ 图片 src 匹配到 English 选项 {idx + 1}: {src}")
                                     break
-
+                                
                                 if src.startswith("http") or src.startswith("/"):
                                     base_url = page.url.rstrip("/").rstrip("/auth/login")
                                     full_url = src if src.startswith("http") else base_url + src
@@ -639,15 +624,14 @@ def switch_language_to_en(page):
                                         break
                         except Exception as e:
                             pass
-
+                            
                     except Exception as e:
                         print(f"     ❌ 选项 {idx + 1} 处理失败: {e}")
                         continue
-
+                        
             except Exception as e:
                 print(f"❌ 遍历弹窗选项失败: {e}")
 
-    # 4.3 最终兜底：全局搜索包含 English 的按钮
     if not en_option:
         print("⚠️ 弹窗内未找到，尝试全局搜索...")
         try:
@@ -671,14 +655,12 @@ def switch_language_to_en(page):
         diagnostic_screenshot(page, "lang_switch_en_not_found")
         return False
 
-    # 5. 点击 English 选项
     en_option.scroll_into_view_if_needed()
     time.sleep(0.3)
     en_option.click()
     print("✅ 已点击 English 语言选项")
     time.sleep(3)
 
-    # 6. 验证切换结果
     try:
         for _ in range(5):
             if en_option.is_visible(timeout=500):
@@ -696,7 +678,7 @@ def switch_language_to_en(page):
                 return True
     except:
         pass
-
+    
     try:
         body_text = page.locator("body").inner_text()
         if "My services" in body_text or "Dashboard" in body_text:
@@ -704,12 +686,11 @@ def switch_language_to_en(page):
             return True
     except:
         pass
-
+        
     print("⚠️ 无法验证语言切换结果，继续执行")
     return True
 
 
-# ==================== 续期相关函数 ====================
 def needs_renewal(status_text):
     if not status_text:
         return False
@@ -724,8 +705,7 @@ def needs_renewal(status_text):
 
 def perform_renewal(page):
     global NEED_RENEWAL, RENEWAL_SUCCESS
-    print("
-🔄 开始执行续期操作...")
+    print("\n🔄 开始执行续期操作...")
     close_install_popup(page)
 
     try:
@@ -759,8 +739,7 @@ def perform_renewal(page):
                 model_name = safe_find_text(row, ["strong.home-renewal-name", ".renewal-name", "td:nth-child(2)", ".model"])
                 renewal_date = safe_find_text(row, ["strong.home-renewal-date-main", ".renewal-date", "td:nth-child(3)", ".date"])
 
-                print(f"
-📦 项目 {idx + 1}: {model_name or '未知'}")
+                print(f"\n📦 项目 {idx + 1}: {model_name or '未知'}")
                 print(f"  📅 续期日期: {renewal_date or '未知'}")
                 print(f"  📊 状态: {status or '未知'}")
 
@@ -821,8 +800,7 @@ def perform_renewal(page):
 
 
 def navigate_to_services(page):
-    print("
-📂 点击 My services / Mes services 导航...")
+    print("\n📂 点击 My services / Mes services 导航...")
     nav_selectors = [
         "a[aria-label='My services']",
         "a[href='/dashboard/projects']",
@@ -860,8 +838,7 @@ def navigate_to_services(page):
 
 
 def click_manage_button(page):
-    print("
-🔧 点击 Manage / Gérer 按钮...")
+    print("\n🔧 点击 Manage / Gérer 按钮...")
     manage_selectors = [
         "a.client-btn--primary[href^='/server/']",
         "a[href^='/server/'].client-btn",
@@ -899,18 +876,9 @@ def click_manage_button(page):
     return True
 
 
-# ==================== 重写：获取服务器信息（对齐 Selenium v6.1）====================
 def get_server_info(page):
-    """
-    获取服务器详情页信息，对齐原始 Selenium v6.1 逻辑：
-    - 服务器名称
-    - 状态 (online/offline)
-    - Time remaining / Plan / Renewal note（绿色背景 div）
-    - Status / Uptime（stat-item div，Online 时才有）
-    """
     global SERVER_STATUS, SERVER_UPTIME
-    print("
-📊 获取服务器信息...")
+    print("\n📊 获取服务器信息...")
     info = {
         "time_remaining": "",
         "plan": "",
@@ -921,15 +889,12 @@ def get_server_info(page):
         "uptime": "",
     }
 
-    # 1. 获取服务器名称
     try:
         info["server_name"] = page.locator("h1, .server-name, [class*='server-title']").first.inner_text(timeout=3000).strip()
     except:
         info["server_name"] = "ACL Cloud Server"
 
-    # 2. 获取状态（优先从 stat-item 的 data-color 或 status-badge 判断）
     try:
-        # 方法 A: status-badge
         badge = page.locator("span.status-badge[data-status], .status-badge, [class*='status-badge']").first
         if badge.is_visible(timeout=2000):
             ds = (badge.get_attribute("data-status") or "").lower()
@@ -946,9 +911,7 @@ def get_server_info(page):
     except Exception as e:
         print(f"  ⚠️ status-badge 检测失败: {e}")
 
-    # 3. 获取 Time remaining / Plan / Renewal（绿色背景信息卡片）
     try:
-        # 多策略定位信息容器
         info_container = None
         info_selectors = [
             "div[style*='background: rgba(49, 95, 79']",
@@ -973,8 +936,7 @@ def get_server_info(page):
 
         if info_container:
             text = info_container.inner_text()
-            lines = [line.strip() for line in text.split('
-') if line.strip()]
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
             for line in lines:
                 if "Time remaining" in line or "Temps restant" in line:
                     info["time_remaining"] = line.split(":", 1)[-1].strip()
@@ -991,7 +953,6 @@ def get_server_info(page):
     except Exception as e:
         print(f"  ❌ 获取 Time remaining 信息失败: {e}")
 
-    # 4. 获取 Status / Uptime（stat-item，Online 时才有意义）
     try:
         stat_items = page.locator("div.stat-item").all()
         for item in stat_items:
@@ -1014,22 +975,13 @@ def get_server_info(page):
     return info
 
 
-# ==================== 重写：电源管理（Online 获取 Uptime，Offline 执行 Start）====================
 def manage_server_power(page):
-    """
-    检测服务器电源状态：
-    - Offline → 执行 Start
-    - Online  → 获取 Uptime，不执行 Restart
-    """
     global POWER_ACTION, SERVER_UPTIME
-    print("
-⚡ 检测服务器电源状态并执行操作...")
+    print("\n⚡ 检测服务器电源状态并执行操作...")
 
-    # 刷新状态检测
     is_offline = False
     status_text = ""
 
-    # 方法 1: status-badge
     try:
         badge = page.locator("span.status-badge[data-status], .status-badge, [class*='status-badge']").first
         if badge.is_visible(timeout=3000):
@@ -1040,7 +992,6 @@ def manage_server_power(page):
     except Exception as e:
         print(f"  ⚠️ status-badge 检测失败: {e}")
 
-    # 方法 2: stat-item（作为兜底/补充）
     if not status_text:
         try:
             stat_items = page.locator("div.stat-item").all()
@@ -1049,7 +1000,6 @@ def manage_server_power(page):
                     label = item.locator(".stat-label").first.inner_text(timeout=1000).strip()
                     if "Status" in label or "Uptime" in label:
                         value = item.locator(".stat-value").first.inner_text(timeout=1000).strip()
-                        # 如果 uptime 是时间格式（含 h/m/s），说明是在线状态
                         if any(c in value for c in ["h", "m", "s", "d"]):
                             status_text = "online"
                             SERVER_UPTIME = value
@@ -1077,7 +1027,6 @@ def manage_server_power(page):
         return False
     else:
         print("🟢 服务器 Online，不执行重启，仅获取 Uptime...")
-        # 再次确保获取到 uptime
         try:
             stat_items = page.locator("div.stat-item").all()
             for item in stat_items:
@@ -1148,7 +1097,7 @@ def send_wechat_notification(info, need_renewal, renewal_success, power_action):
 🔧 <b>执行动作:</b> {action_text}
 ⚡ <b>电源状态:</b> {power_text}
 
-🔗 <a href="{server_url}">点击访问服务器详情页</a>
+🔗 <a href=\"{server_url}\">点击访问服务器详情页</a>
 
 ⏱️ 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
@@ -1214,15 +1163,13 @@ def main():
             page = context.new_page()
             print("✅ Chromium 已启动，ffmpeg 录制中...")
 
-            # ========== 登录流程 ==========
             if not wait_for_login_page(page, LOGIN_URL):
                 print("❌ 登录页加载失败")
                 diagnostic_screenshot(page, "login_page_failed")
                 send_wechat_notification({"server_name": "登录页加载失败"}, False, False, "none")
                 return False
 
-            print("
-🔑 输入凭据...")
+            print("\n🔑 输入凭据...")
             email_ok = wait_and_type(page, [
                 "input[name='email']", "input[type='email']",
                 "input[placeholder*='email' i]", "input[name='username']",
@@ -1252,11 +1199,9 @@ def main():
             print("✅ 凭据已输入")
             time.sleep(1)
 
-            # 验证码 + 登录
             login_ok = False
             for attempt in range(MAX_RETRIES):
-                print(f"
-🔄 验证码尝试 {attempt+1}/{MAX_RETRIES}")
+                print(f"\n🔄 验证码尝试 {attempt+1}/{MAX_RETRIES}")
                 if process_captcha(page, flow_name="login"):
                     if wait_and_click(page, [
                         "button:has-text('Sign in')",
@@ -1277,12 +1222,9 @@ def main():
                 send_wechat_notification({"server_name": "登录失败"}, False, False, "none")
                 return False
 
-            # ========== 登录成功后流程 ==========
-            print("
-✅ 登录成功，开始后续操作...")
+            print("\n✅ 登录成功，开始后续操作...")
             base_url = LOGIN_URL.rstrip("/auth/login").rstrip("/")
 
-            # 确保在仪表盘
             if "dashboard" not in page.url.lower():
                 print("📂 导航到 Dashboard...")
                 page.goto(base_url + "/dashboard", wait_until="networkidle")
@@ -1290,19 +1232,15 @@ def main():
 
             close_install_popup(page)
 
-            # 语言切换（弹窗式 + OCR 兜底）
             switch_language_to_en(page)
 
-            # 再次确保在仪表盘
             if "dashboard" not in page.url.lower():
                 page.goto(base_url + "/dashboard", wait_until="networkidle")
                 time.sleep(3)
 
             close_install_popup(page)
 
-            # ========== 检查是否需要续期 ==========
-            print("
-🔍 检查是否需要续期...")
+            print("\n🔍 检查是否需要续期...")
             has_renewal = False
             try:
                 renewal_table = page.locator("div.home-renewal-table, .renewal-table, [class*='renewal']").first
@@ -1316,49 +1254,38 @@ def main():
             except Exception:
                 print("ℹ️ 仪表盘上没有续期表格")
 
-            # ========== 情况1: 需要续期 ==========
             if has_renewal:
-                print("
-📌 执行续期流程...")
+                print("\n📌 执行续期流程...")
                 perform_renewal(page)
 
-                # 续期后导航到服务列表
                 navigate_to_services(page)
                 click_manage_button(page)
 
-                # 获取服务器信息（包含 uptime）
                 server_info = get_server_info(page)
 
-                # 电源管理（Online 获取 uptime，Offline 执行 start）
                 manage_server_power(page)
 
-            # ========== 情况2: 不需要续期 ==========
             else:
-                print("
-📌 无需续期，直接获取服务器信息...")
+                print("\n📌 无需续期，直接获取服务器信息...")
                 navigate_to_services(page)
                 click_manage_button(page)
                 server_info = get_server_info(page)
                 manage_server_power(page)
 
-            # ========== 发送通知 ==========
             send_wechat_notification(server_info, NEED_RENEWAL, RENEWAL_SUCCESS, POWER_ACTION)
 
-            print("
-🎉 所有操作已完成！")
+            print("\n🎉 所有操作已完成！")
             return True
 
         except Exception as e:
-            print(f"
-❌ 发生错误: {e}")
+            print(f"\n❌ 发生错误: {e}")
             if page:
                 diagnostic_screenshot(page, "fatal_error")
             send_wechat_notification({"server_name": f"脚本异常: {str(e)[:50]}"}, False, False, "none")
             return False
 
         finally:
-            print("
-🎬 保存录屏...")
+            print("\n🎬 保存录屏...")
             try:
                 if context:
                     context.close()
