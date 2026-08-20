@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 修复版 v5.0）
-修复：登录成功检测改为轮询等待，避免误判
-特性：headless 原生录视频、无需 Xvfb、智能电源管理
+ACL Cloud 自动续期脚本（Playwright + Xvfb + ffmpeg 完整录屏版 v6.0）
+修复：
+  1. 登录检测改为 URL + 页面内容双重检测（支持 SPA 前端路由）
+  2. 录屏改为 Xvfb + ffmpeg 系统级录屏，可录制完整浏览器 UI（地址栏、按钮等）
+特性：完整浏览器录屏、无需真实显示器、智能电源管理
 """
 
 import os
 import sys
 import time
 import glob
+import subprocess
+import signal
+import atexit
 import requests
 from datetime import datetime
 from PIL import Image
@@ -24,13 +29,97 @@ LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
 WECHAT_WEBHOOK_KEY = os.getenv("WECHAT_WEBHOOK_KEY", "")
 MAX_RETRIES = 3
 VIDEO_DIR = "videos"
+RECORDING_FILE = "full_operation_recording.mp4"
 DIAGNOSTIC_PREFIX = "diag"
+DISPLAY_NUM = ":99"
+SCREEN_SIZE = "1920x1080x24"
 # ==========================
 
 NEED_RENEWAL = False
 RENEWAL_SUCCESS = False
 SERVER_STATUS = "unknown"
 POWER_ACTION = "none"
+
+_xvfb_proc = None
+_ffmpeg_proc = None
+
+
+def _kill_proc(proc, name="process", timeout=5):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    print(f"⏹️  {name} 已终止")
+
+
+def start_xvfb():
+    """启动 Xvfb 虚拟显示"""
+    global _xvfb_proc
+    if os.getenv("DISPLAY"):
+        print(f"ℹ️  已有 DISPLAY={os.getenv('DISPLAY')}")
+        return
+    print(f"🖥️  启动 Xvfb {DISPLAY_NUM} ({SCREEN_SIZE})...")
+    cmd = ["Xvfb", DISPLAY_NUM, "-screen", "0", SCREEN_SIZE,
+           "-ac", "+extension", "RANDR", "-noreset"]
+    _xvfb_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.environ["DISPLAY"] = DISPLAY_NUM
+    time.sleep(2)
+    if _xvfb_proc.poll() is not None:
+        raise RuntimeError("Xvfb 启动失败")
+    print(f"✅ Xvfb 已启动")
+
+
+def stop_xvfb():
+    global _xvfb_proc
+    _kill_proc(_xvfb_proc, "Xvfb")
+    _xvfb_proc = None
+
+
+def start_ffmpeg_recording():
+    """启动 ffmpeg 录整个屏幕（可录到浏览器 UI）"""
+    global _ffmpeg_proc
+    print(f"🎥 启动 ffmpeg 录屏 → {RECORDING_FILE}")
+    cmd = [
+        "ffmpeg",
+        "-f", "x11grab",
+        "-video_size", "1920x1080",
+        "-i", DISPLAY_NUM,
+        "-r", "10",
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "30",
+        "-movflags", "+faststart",
+        "-y",
+        RECORDING_FILE
+    ]
+    _ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    if _ffmpeg_proc.poll() is not None:
+        raise RuntimeError("ffmpeg 启动失败")
+    print("✅ ffmpeg 录屏已启动")
+
+
+def stop_ffmpeg_recording():
+    global _ffmpeg_proc
+    if _ffmpeg_proc is None:
+        return
+    print("⏹️  停止 ffmpeg 录屏...")
+    try:
+        _ffmpeg_proc.send_signal(signal.SIGTERM)
+        _ffmpeg_proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        _kill_proc(_ffmpeg_proc, "ffmpeg", timeout=3)
+    _ffmpeg_proc = None
+    if os.path.exists(RECORDING_FILE):
+        size_mb = os.path.getsize(RECORDING_FILE) / (1024 * 1024)
+        print(f"✅ 录屏已保存: {RECORDING_FILE} ({size_mb:.1f} MB)")
+    else:
+        print("⚠️ 未找到录屏文件")
 
 
 def ensure_video_dir():
@@ -147,7 +236,7 @@ def wait_for_login_page(page, url):
 def process_captcha(page, flow_name=""):
     print(f"\n🔄 开始处理{flow_name}人机验证...")
 
-    # ── 1. 点击复选框 ──────────────────────────────────────────────────────
+    # 1. 点击复选框
     try:
         checkbox = page.locator(
             "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"
@@ -162,7 +251,7 @@ def process_captcha(page, flow_name=""):
         print(f"  ⚠️ 点击复选框失败: {e}")
         return False
 
-    # ── 2. 获取提示文字 ────────────────────────────────────────────────────
+    # 2. 获取提示文字
     try:
         prompt = page.locator("div.auth-captcha-prompt, .captcha-prompt").first
         prompt.wait_for(state="visible", timeout=5000)
@@ -172,7 +261,7 @@ def process_captcha(page, flow_name=""):
         print(f"  ⚠️ 获取提示文字失败: {e}")
         return False
 
-    # ── 3. 获取选项 ─────────────────────────────────────────────────────────
+    # 3. 获取选项
     try:
         options = page.locator(
             "div.auth-captcha-options button, .captcha-options .captcha-option, "
@@ -186,7 +275,7 @@ def process_captcha(page, flow_name=""):
         print(f"  ⚠️ 获取选项失败: {e}")
         return False
 
-    # ── 4. OCR 识别并点击 ──────────────────────────────────────────────────
+    # 4. OCR 识别并点击
     base_url = page.url.rstrip("/auth/login").rstrip("/")
     target = strong_text.lower().replace(" ", "").replace("-", "")
     clicked = False
@@ -218,10 +307,8 @@ def process_captcha(page, flow_name=""):
         print("  ❌ 未点击任何选项")
         return False
 
-    # ── 5. 检查验证结果（三种检测模式）──────────────────────────────────────
+    # 5. 检查验证结果
     time.sleep(2)
-
-    # 模式 A：检测 Verified / Vérifié 标签
     try:
         verified = page.locator("span.auth-captcha-label, .captcha-label").first
         if verified.is_visible():
@@ -232,7 +319,6 @@ def process_captcha(page, flow_name=""):
     except:
         pass
 
-    # 模式 B：检测验证码元素是否消失 + 错误提示
     try:
         error_selectors = [
             ".auth-captcha-error", ".captcha-error", ".text-danger",
@@ -290,41 +376,100 @@ def process_captcha(page, flow_name=""):
     except Exception as e:
         print(f"  ⚠️ 验证结果检测异常: {e}")
 
-    # 模式 C：兜底
     print("  ⚠️ 无法确认验证状态，假设通过（无错误提示）")
     return True
 
 
-def check_login_success(page, timeout=30):
+# =============================================================================
+# 🔑 登录成功检测（修复：URL + 页面内容双重检测，支持 SPA）
+# =============================================================================
+def check_login_success(page, timeout=20):
     """
-    检测登录是否成功：轮询检测 URL 变化，最多等待 timeout 秒
-    修复：避免只 sleep 一次就判断，导致误判为失败
+    检测登录是否成功：
+      方法1: URL 不再包含 login/auth
+      方法2: 页面出现 Dashboard 特征元素（Bienvenue、Dashboard、Mes services 等）
+      方法3: 登录表单消失 + 出现 Dashboard 内容
+    适用于 SPA 前端路由（URL 不变但内容已切换）
     """
-    print(f"  ⏳ 等待登录跳转（最多 {timeout} 秒）...")
+    print(f"  ⏳ 等待登录跳转/渲染（最多 {timeout} 秒）...")
     start_time = time.time()
     last_url = page.url
 
     while time.time() - start_time < timeout:
         current_url = page.url
-        # 如果 URL 变了且不含 login，说明登录成功
-        if "login" not in current_url.lower():
-            print(f"  🎉 登录成功！当前 URL: {current_url}")
+
+        # 方法 1：URL 变化且不含 login
+        if "login" not in current_url.lower() and "/auth/" not in current_url.lower():
+            print(f"  🎉 登录成功（URL 跳转）: {current_url}")
             return True
-        # 如果 URL 还在变化（还在跳转中），继续等待
+
+        # 方法 2：检测 Dashboard 特征元素（SPA 页面内容已切换但 URL 没变）
+        try:
+            dashboard_indicators = [
+                "text=Bienvenue",
+                "text=Dashboard",
+                "text=Tableau de bord",
+                "text=Accueil",
+                "text=Mes services",
+                "a[href='/dashboard']",
+                "a[href='/logout']",
+                ".dashboard",
+                "[class*='dashboard']",
+                "nav",  # 左侧导航栏出现
+            ]
+            for sel in dashboard_indicators:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=800):
+                        print(f"  🎉 登录成功（页面内容检测: '{sel}'）URL: {current_url}")
+                        return True
+                except:
+                    continue
+        except:
+            pass
+
+        # 方法 3：登录表单消失 + 页面有 Dashboard 文字
+        try:
+            email_input = page.locator("input[name='email'], input[name='username'], input[type='email']").first
+            pwd_input = page.locator("input[type='password']").first
+            form_gone = (not email_input.is_visible(timeout=500)) or (not pwd_input.is_visible(timeout=500))
+
+            if form_gone:
+                # 进一步确认页面有 Dashboard 内容
+                body_text = page.locator("body").inner_text()
+                dashboard_keywords = ["Bienvenue", "Dashboard", "Tableau de bord", 
+                                      "Mes services", "Accueil", "Commander", 
+                                      "Suivi des dépenses", "Vos prochains renouvellements"]
+                if any(kw in body_text for kw in dashboard_keywords):
+                    print(f"  🎉 登录成功（登录表单消失 + Dashboard 内容）")
+                    return True
+        except:
+            pass
+
+        # URL 还在变化，继续等待
         if current_url != last_url:
             print(f"  🔄 URL 变化中: {current_url}")
             last_url = current_url
-            time.sleep(1)
-            continue
-        # URL 没变，再等 1 秒轮询
+
         time.sleep(1)
 
-    # 超时后最终检查
+    # 最终确认
     final_url = page.url
-    print(f"  ⚠️ 登录检测超时，最终 URL: {final_url}")
-    if "login" not in final_url.lower():
-        print(f"  🎉 登录成功（最终确认）！URL: {final_url}")
+    if "login" not in final_url.lower() and "/auth/" not in final_url.lower():
+        print(f"  🎉 登录成功（最终 URL 确认）: {final_url}")
         return True
+
+    # 最终内容确认
+    try:
+        body_text = page.locator("body").inner_text()
+        if any(kw in body_text for kw in ["Bienvenue", "Dashboard", "Tableau de bord", 
+                                           "Mes services", "Accueil", "Suivi des dépenses"]):
+            print(f"  🎉 登录成功（最终内容确认）")
+            return True
+    except:
+        pass
+
+    print(f"  ⚠️ 登录检测超时，最终 URL: {final_url}")
     return False
 
 
@@ -498,28 +643,38 @@ def main():
     context = None
     browser = None
 
+    # 注册清理函数
+    atexit.register(stop_ffmpeg_recording)
+    atexit.register(stop_xvfb)
+
+    # 1. 启动 Xvfb
+    start_xvfb()
+
+    # 2. 启动 ffmpeg 录屏（在浏览器之前）
+    start_ffmpeg_recording()
+
     with sync_playwright() as p:
         try:
-            print("🚀 启动 Chromium...")
+            print("🚀 启动 Chromium（非 headless 模式，显示真实浏览器窗口）...")
             browser = p.chromium.launch(
-                headless=True,
+                headless=False,  # 🔑 关键：非 headless，显示真实浏览器 UI
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-blink-features=AutomationControlled",
                     "--window-size=1920,1080",
+                    "--start-maximized",
                 ]
             )
 
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
-                record_video_dir=VIDEO_DIR,
-                record_video_size={"width": 1280, "height": 720},
+                # 不再用 Playwright 原生录屏，改用 ffmpeg 录 Xvfb
             )
 
             page = context.new_page()
-            print("✅ Playwright 启动完成，视频录制中...")
+            print("✅ Chromium 已启动（真实浏览器窗口，ffmpeg 录制中）")
 
             # ========== 登录 ==========
             if not wait_for_login_page(page, LOGIN_URL):
@@ -540,11 +695,6 @@ def main():
             if not email_ok:
                 print("❌ 无法输入邮箱")
                 diagnostic_screenshot(page, "email_input_failed")
-                try:
-                    html = page.content()
-                    print(f"\n📄 页面源码前 3000 字符:\n{html[:3000]}")
-                except:
-                    pass
                 send_wechat_notification({"server_name": "邮箱输入失败"}, False, False, "none")
                 return False
 
@@ -564,7 +714,7 @@ def main():
             print("✅ 凭据已输入")
             time.sleep(1)
 
-            # 验证码 + 登录（修复：使用轮询检测登录成功）
+            # 验证码 + 登录（修复：双重检测）
             login_ok = False
             for attempt in range(MAX_RETRIES):
                 print(f"\n🔄 验证码尝试 {attempt+1}/{MAX_RETRIES}")
@@ -575,8 +725,8 @@ def main():
                         "input[type='submit']",
                         "button:has-text('Connexion')",
                     ], label="Sign in 按钮"):
-                        # 🔧 修复：使用轮询检测，而不是固定 sleep 4 秒
-                        if check_login_success(page, timeout=15):
+                        # 🔧 修复：使用 URL + 内容双重检测
+                        if check_login_success(page, timeout=20):
                             login_ok = True
                             break
                         else:
@@ -699,10 +849,11 @@ def main():
             except Exception as e:
                 print(f"⚠️ 关闭浏览器: {e}")
 
-            video_files = glob.glob(os.path.join(VIDEO_DIR, "*.webm"))
-            if video_files:
-                video_path = video_files[0]
-                print(f"✅ 视频: {video_path}")
+            stop_ffmpeg_recording()
+            stop_xvfb()
+
+            if os.path.exists(RECORDING_FILE):
+                video_path = RECORDING_FILE
 
             send_wechat_notification(server_info, NEED_RENEWAL, RENEWAL_SUCCESS, POWER_ACTION, video_path)
 
