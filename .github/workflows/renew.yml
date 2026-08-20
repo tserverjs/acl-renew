@@ -87,11 +87,11 @@ jobs:
           tesseract --version 2>/dev/null | head -1 | awk '{print "✅ " $4}' || echo "❌ 异常"
           echo "└──────────────────────────────────────────┘"
 
-      - name: 🤖 执行自动化脚本（v6 完整浏览器录屏版）
+      - name: 🤖 执行自动化脚本（v7 完整浏览器录屏版）
         run: |
           mkdir -p videos
           echo "🚀 脚本启动中..."
-          python3 acl_cloud_playwright_v6.py
+          python3 acl_cloud_playwright_v7.py
           echo "🏁 脚本执行完毕"
         env:
           PYTHONUNBUFFERED: "1"
