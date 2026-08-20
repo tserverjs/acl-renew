@@ -51,7 +51,6 @@ jobs:
             tesseract-ocr-fra \
             fonts-noto-cjk \
             fonts-wqy-zenhei \
-            libgl1-mesa-glx \
             libglib2.0-0
           echo "✅ 系统依赖安装完成"
 
