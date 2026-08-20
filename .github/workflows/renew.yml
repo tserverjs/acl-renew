@@ -1,5 +1,5 @@
 # =============================================================================
-# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright 版 v4）
+# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright 版 v5）
 #    验证码逻辑完全对齐原始 Selenium 代码
 # =============================================================================
 
@@ -85,11 +85,11 @@ jobs:
           ffmpeg -version 2>/dev/null | head -1 | awk '{print "✅ " $3}' || echo "❌ 异常"
           echo "└──────────────────────────────────────────┘"
 
-      - name: 🤖 执行 Playwright 自动化脚本（v4 验证码修复版）
+      - name: 🤖 执行 Playwright 自动化脚本（v5 验证码修复版）
         run: |
           mkdir -p videos
           echo "🚀 脚本启动中..."
-          python3 acl_cloud_playwright_v4.py
+          python3 acl_cloud_playwright_v5.py
           echo "🏁 脚本执行完毕"
         env:
           PYTHONUNBUFFERED: "1"
