@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.3）
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.4）
 更新：
   1. 语言切换改为弹窗式识别 + OCR 兜底
   2. 服务器信息获取对齐原始 Selenium v6.1 逻辑
   3. 电源管理：通过 Uptime 判断在线（有运行时间=Online），Online 不重启，Offline 执行 Start
-  4. 企业微信通知改为 Markdown 格式，去掉 <b> 标签，美化排版
+  4. 企业微信通知改为纯文本格式，去掉 <b> 标签，美化排版
+  5. 【v7.4 修复】验证码/国旗图片下载：
+     - 相对路径改用 urllib.parse.urljoin(page.url, src) 拼接，
+       修复续期弹窗场景下 base_url 错误导致 URL 出现 /dashboard/dashboard 重复、
+       下载到 404 HTML 页面、PIL 报 "cannot identify image file" 的问题
+     - 改用 page.context.request.get() 下载，共享浏览器 Cookie/Session
+     - 支持 data:image Base64 内联图片直接解码
+     - 打印完整 URL 与 HTTP 状态码，便于排查
 """
 
 import os
 import sys
 import time
+import base64
 import subprocess
 import signal
 import atexit
 import requests
 from datetime import datetime
+from urllib.parse import urljoin
 from PIL import Image
 from io import BytesIO
 import pytesseract
@@ -43,6 +52,46 @@ SERVER_UPTIME = ""
 
 _xvfb_proc = None
 _ffmpeg_proc = None
+
+
+def download_image_bytes(page, src, label="图片"):
+    """
+    统一图片下载入口（v7.4 修复版）。
+    - 相对路径使用 urljoin(page.url, src) 拼接（不再手动裁剪 base_url）
+    - 使用 page.context.request.get() 共享浏览器 Cookie/Session
+    - 支持 data:image Base64 内联图片
+    返回: bytes 或 None
+    """
+    if not src:
+        print(f"     ⚠️ {label}: src 为空")
+        return None
+
+    try:
+        # 1) data URI 直接解码
+        if src.startswith("data:image"):
+            try:
+                _, b64data = src.split(",", 1)
+                return base64.b64decode(b64data)
+            except Exception as e:
+                print(f"     ⚠️ {label}: data URI 解码失败: {e}")
+                return None
+
+        # 2) 相对/绝对路径统一拼接（关键修复：不再依赖 rstrip("/auth/login")）
+        full_url = urljoin(page.url, src)
+
+        # 3) 使用浏览器上下文请求，自动携带 Cookie
+        resp = page.context.request.get(full_url, timeout=15000)
+        if not resp.ok:
+            print(f"     ❌ {label}: HTTP {resp.status} {full_url}")
+            return None
+        body = resp.body()
+        if not body or len(body) < 100:
+            print(f"     ⚠️ {label}: 响应体过小 ({len(body) if body else 0} bytes) {full_url}")
+            return None
+        return body
+    except Exception as e:
+        print(f"     ❌ {label}: 下载失败: {e}")
+        return None
 
 
 def _kill_proc(proc, name="process", timeout=5):
@@ -262,6 +311,7 @@ def wait_for_login_page(page, url):
 
 
 def process_captcha(page, flow_name=""):
+    """处理人机验证（v7.4：图片下载统一走 download_image_bytes，修复 URL 拼接与 Cookie 问题）"""
     print(f"\n🔄 开始处理{flow_name}人机验证...")
 
     try:
@@ -300,7 +350,6 @@ def process_captcha(page, flow_name=""):
         print(f"  ⚠️ 获取选项失败: {e}")
         return False
 
-    base_url = page.url.rstrip("/auth/login").rstrip("/")
     target = strong_text.lower().replace(" ", "").replace("-", "")
     clicked = False
 
@@ -308,10 +357,14 @@ def process_captcha(page, flow_name=""):
         try:
             img = btn.locator("img.auth-captcha-option-img, img").first
             src = img.get_attribute("src")
-            full_url = base_url + src if src.startswith("/") else src
-            print(f"     📍 选项 {idx + 1}: {full_url[:50]}...")
-            resp = requests.get(full_url, timeout=10)
-            img_obj = Image.open(BytesIO(resp.content)).convert("L")
+            full_url = urljoin(page.url, src) if src else "(无 src)"
+            print(f"     📍 选项 {idx + 1}: {full_url}")
+
+            img_bytes = download_image_bytes(page, src, label=f"选项 {idx + 1}")
+            if img_bytes is None:
+                continue
+
+            img_obj = Image.open(BytesIO(img_bytes)).convert("L")
             img_obj = img_obj.point(lambda x: 255 if x > 128 else 0)
             ocr_text = pytesseract.image_to_string(img_obj, lang='eng', config='--psm 7').strip()
             ocr_clean = ocr_text.lower().replace(" ", "").replace("-", "")
@@ -499,7 +552,7 @@ def switch_language_to_en(page):
             alt_text = flag_img.get_attribute("alt") or ""
             if "english" in alt_text.lower():
                 current_lang = "EN"
-            elif "francais" in alt_text.lower() or "francais" in alt_text.lower():
+            elif "francais" in alt_text.lower() or "français" in alt_text.lower():
                 current_lang = "FR"
         except:
             pass
@@ -542,7 +595,6 @@ def switch_language_to_en(page):
                 loc = page.locator(sel).first
             loc.wait_for(state="visible", timeout=3000)
             if loc.is_visible():
-                html = loc.inner_html().lower()
                 text = loc.inner_text().lower()
                 if "en" in text and "english" in text:
                     en_option = loc
@@ -606,11 +658,10 @@ def switch_language_to_en(page):
                                     print(f"  ✅ 图片 src 匹配到 English 选项 {idx + 1}: {src}")
                                     break
 
-                                if src.startswith("http") or src.startswith("/"):
-                                    base_url = page.url.rstrip("/").rstrip("/auth/login")
-                                    full_url = src if src.startswith("http") else base_url + src
-                                    resp = requests.get(full_url, timeout=10)
-                                    img_obj = Image.open(BytesIO(resp.content)).convert("L")
+                                # v7.4：OCR 识别走统一下载函数（修复 URL 拼接 + 携带 Cookie）
+                                img_bytes = download_image_bytes(page, src, label=f"国旗选项 {idx + 1}")
+                                if img_bytes:
+                                    img_obj = Image.open(BytesIO(img_bytes)).convert("L")
                                     img_obj = img_obj.point(lambda x: 255 if x > 128 else 0)
                                     ocr_text = pytesseract.image_to_string(
                                         img_obj, lang='eng', config='--psm 7'
@@ -620,7 +671,7 @@ def switch_language_to_en(page):
                                         en_option = btn
                                         print(f"  ✅ OCR 匹配到 English 选项 {idx + 1}")
                                         break
-                        except Exception as e:
+                        except Exception:
                             pass
 
                     except Exception as e:
@@ -977,7 +1028,6 @@ def manage_server_power(page):
     global POWER_ACTION, SERVER_UPTIME
     print("\n⚡ 检测服务器电源状态并执行操作...")
 
-    # 优先使用 get_server_info() 已获取的 SERVER_UPTIME
     has_uptime = False
     uptime_value = SERVER_UPTIME
 
@@ -985,7 +1035,6 @@ def manage_server_power(page):
         has_uptime = True
         print(f"  📊 使用已获取的运行时间: {uptime_value} → Online")
     else:
-        # 兜底：重新从页面获取
         try:
             stat_items = page.locator("div.stat-item").all()
             for item in stat_items:
@@ -1037,7 +1086,6 @@ def send_wechat_notification(info, need_renewal, renewal_success, power_action):
     status = info.get("status", "unknown")
     uptime = info.get("uptime", SERVER_UPTIME or "未知")
 
-    # 状态判断：有运行时间 = 在线
     if uptime and uptime != "未知" and any(c in uptime for c in ["h", "m", "s", "d"]):
         status = "online"
 
@@ -1066,7 +1114,6 @@ def send_wechat_notification(info, need_renewal, renewal_success, power_action):
 
     sem = "🟢 在线" if status == "online" else "🔴 离线" if status == "offline" else "⚪ 未知"
 
-    # 纯 text 格式，不使用 markdown / HTML 标签
     content = f"""{color} ACL Cloud 服务器状态报告 {color}
 
 📌 服务器: {server_name}
@@ -1106,6 +1153,7 @@ def send_wechat_notification(info, need_renewal, renewal_success, power_action):
         print(f"❌ 发送通知异常: {e}")
         return False
 
+
 def main():
     global NEED_RENEWAL, RENEWAL_SUCCESS, SERVER_STATUS, POWER_ACTION, SERVER_UPTIME
 
@@ -1115,7 +1163,6 @@ def main():
 
     ensure_video_dir()
     server_info = {}
-    video_path = ""
     page = None
     context = None
     browser = None
@@ -1280,8 +1327,7 @@ def main():
             stop_xvfb()
 
             if os.path.exists(RECORDING_FILE):
-                video_path = RECORDING_FILE
-                print(f"✅ 视频: {video_path}")
+                print(f"✅ 视频: {RECORDING_FILE}")
 
 
 if __name__ == "__main__":
