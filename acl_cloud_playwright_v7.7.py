@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.7）
-更新策略：
-  1. 【登录流程人机验证】保持原样（包含尝试点击 "I am not a robot" 复选框逻辑）
-  2. 【续期流程人机验证】专门适配：直接锁定 modal/dialog 容器，不找复选框，进行降噪与图片 OCR 匹配
-  3. 【其余逻辑】维持完全不变（代理支持、页面导航、语言切换、电源管理与微信通知等）
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.8）
+优化：
+  1. 续期弹窗支持点击复选框并增加了必要的加载等待时间。
+  2. 延长 OCR 与选项提取前的显式等待，确保验证内容完整渲染。
 """
 
 import os
@@ -28,7 +27,7 @@ USERNAME = os.getenv("ACL_USERNAME", "")
 PASSWORD = os.getenv("ACL_PASSWORD", "")
 LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
 WECHAT_WEBHOOK_KEY = os.getenv("WECHAT_WEBHOOK_KEY", "")
-SERVER_ID = os.getenv("ACL_SERVER_ID", "3727")   # 服务器 ID，Manage 按钮找不到时直接访问详情页
+SERVER_ID = os.getenv("ACL_SERVER_ID", "3727")   # 服务器 ID
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")     # 代理服务器地址
 MAX_RETRIES = 3
 VIDEO_DIR = "videos"
@@ -316,75 +315,101 @@ def wait_for_login_page(page, url):
 def process_captcha(page, flow_name=""):
     """
     通用人机验证处理逻辑：
-    - 登录流程 (flow_name="login"): 保持原样，尝试寻找并点击 "I am not a robot" 复选框。
-    - 续期流程 (flow_name="renewal_popup"): 专属优化，锁定 modal/dialog 容器，跳过复选框直接辨识选项。
+    - 在登录和续期场景下，均先点击复选框，并预留足够的等待加载时间。
     """
-    print(f"\n🔄 开始处理{flow_name}人机验证...")
+    print(f"\n🔄 开始处理 {flow_name} 人机验证...")
 
     is_renewal = (flow_name == "renewal_popup")
 
-    # ================= 1. 范围与前置操作 =================
+    # ================= 1. 寻找作用域容器 =================
     if is_renewal:
-        time.sleep(1)
-        # 续期弹窗作用域限定
-        container = page.locator("div[role='dialog'], .auth-captcha-box").first
+        # 延长等待续期弹窗出现的超时时长
+        container = page.locator("div[role='dialog'], .auth-captcha-box, div[class*='modal']").first
         try:
-            container.wait_for(state="visible", timeout=8000)
+            container.wait_for(state="visible", timeout=12000)
+            print("  ✅ 已捕捉到续期验证弹窗，等待 3 秒加载控件...")
+            time.sleep(3)
         except Exception:
             print("  ⚠️ 未找到续期验证码弹窗容器")
             return False
     else:
         container = page
-        # 登录页面保留复选框点击逻辑
-        try:
-            checkbox = page.locator("div.auth-captcha-inner, div.auth-captcha-checkbox").first
-            if checkbox.is_visible(timeout=3000):
-                print("  👉 点击 'I am not a robot' 复选框...")
-                checkbox.click()
-                time.sleep(1.5)
-        except Exception as e:
-            print(f"  ℹ️ 跳过复选框点击: {e}")
 
-    # ================= 2. 识别目标词 =================
-    strong_text = ""
+    # ================= 2. 点击人机验证复选框 =================
     try:
-        strong_loc = container.locator("strong").first
-        if strong_loc.is_visible(timeout=2000):
-            strong_text = strong_loc.inner_text().strip()
-    except Exception:
-        pass
+        checkbox_selectors = [
+            "div.auth-captcha-inner",
+            "div.auth-captcha-checkbox",
+            "text='I am not a robot'",
+            "//div[contains(text(), 'I am not a robot')]"
+        ]
+        clicked_cb = False
+        for cb_sel in checkbox_selectors:
+            cb_loc = container.locator(cb_sel).first
+            if cb_loc.is_visible(timeout=3000):
+                print(f"  👉 点击 'I am not a robot' 复选框 ({cb_sel})...")
+                cb_loc.click()
+                clicked_cb = True
+                print("  ⏳ 等待 2.5 秒供验证题目与图片完全展开加载...")
+                time.sleep(2.5)
+                break
+        if not clicked_cb:
+            print("  ℹ️ 未找到复选框，可能验证题目已自动展开")
+    except Exception as e:
+        print(f"  ℹ️ 点击复选框提示: {e}")
 
-    if not strong_text:
+    # ================= 3. 识别目标词（增加等待） =================
+    strong_text = ""
+    start_wait = time.time()
+    while time.time() - start_wait < 10:  # 循环等待提示词加载
+        try:
+            strong_loc = container.locator("strong").first
+            if strong_loc.is_visible(timeout=1000):
+                strong_text = strong_loc.inner_text().strip()
+                if strong_text:
+                    break
+        except Exception:
+            pass
+
         try:
             challenge = container.locator(".auth-captcha-challenge, .auth-captcha-prompt").first
             aria_txt = challenge.get_attribute("aria-label") or challenge.inner_text()
             if "Click on" in aria_txt:
                 strong_text = aria_txt.split("Click on")[-1].strip()
-        except Exception as e:
-            print(f"  ⚠️ 读取提示文本失败: {e}")
+                if strong_text:
+                    break
+        except Exception:
+            pass
+        time.sleep(0.5)
 
     if not strong_text:
         print("  ❌ 无法识别验证码目标文本")
+        diagnostic_screenshot(page, "captcha_text_not_found")
         return False
 
     print(f"  📝 验证码目标提示文字: '{strong_text}'")
 
-    # ================= 3. 提取候选图片按钮 =================
+    # ================= 4. 提取候选图片按钮（增加等待） =================
+    options = []
     try:
+        # 等待选项加载完成
+        container.locator("button.auth-captcha-option, .auth-captcha-options button").first.wait_for(state="visible", timeout=8000)
         options = container.locator("button.auth-captcha-option, .auth-captcha-options button").all()
         options = [b for b in options if b.is_visible()]
-        if not options:
-            print("  ⚠️ 未找到可点击的图片选项")
-            return False
-        print(f"  📍 共 {len(options)} 个待识别图片选项")
-    except Exception as e:
-        print(f"  ⚠️ 获取图片选项失败: {e}")
+    except Exception:
+        pass
+
+    if not options:
+        print("  ⚠️ 未找到可点击的图片选项")
+        diagnostic_screenshot(page, "captcha_options_not_found")
         return False
+
+    print(f"  📍 共 {len(options)} 个待识别图片选项")
 
     target = strong_text.lower().replace(" ", "").replace("-", "")
     clicked = False
 
-    # ================= 4. RGB 降噪 + 放大 + OCR 识别 =================
+    # ================= 5. RGB 降噪 + 放大 + OCR 识别 =================
     for idx, btn in enumerate(options):
         try:
             img = btn.locator("img").first
@@ -394,7 +419,6 @@ def process_captcha(page, flow_name=""):
             if not img_bytes:
                 continue
 
-            # 过滤彩色线条，保留深色文字（RGB 阈值 < 110）
             img_obj = Image.open(BytesIO(img_bytes)).convert("RGB")
             w, h = img_obj.size
             cleaned_img = Image.new("L", (w, h), 255)
@@ -407,7 +431,7 @@ def process_captcha(page, flow_name=""):
                     if r < 110 and g < 110 and b < 110:
                         cleaned_pixels[x, y] = 0   # 深色文字保留
                     else:
-                        cleaned_pixels[x, y] = 255 # 背景及彩色线条涂白
+                        cleaned_pixels[x, y] = 255 # 背景及干扰涂白
 
             cleaned_img = cleaned_img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
 
@@ -762,16 +786,16 @@ def perform_renewal(page):
             btn.scroll_into_view_if_needed()
             time.sleep(0.5)
             btn.click()
-            print(f"  ✅ 已点击 Renew 按钮")
-            time.sleep(2)
+            print(f"  ✅ 已点击 Renew 按钮，等待 120 秒展现人机验证框...")
+            time.sleep(120)
 
-            # 调用续期专属人机验证识别（flow_name="renewal_popup"）
+            # 调用带加载等待与复选框处理的人机验证识别
             if process_captcha(page, flow_name="renewal_popup"):
                 RENEWAL_SUCCESS = True
                 print("✅ 续期验证通过！")
             else:
                 print("❌ 续期验证失败")
-            time.sleep(2)
+            time.sleep(120)
             close_install_popup(page)
         except Exception as e:
             print(f"  ❌ 处理 Renew 按钮 {idx + 1} 出错: {e}")
@@ -1152,7 +1176,7 @@ def main():
                 print(f"🌐 配置代理: {PROXY_SERVER}")
                 parsed_proxy = urlparse(PROXY_SERVER)
                 proxy_cfg = {"server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"}
-                if parsed_proxy.username and parsed_proxy.password:
+                if parsed_proxy.username and parsed_password:
                     proxy_cfg["username"] = parsed_proxy.username
                     proxy_cfg["password"] = parsed_proxy.password
                 launch_options["proxy"] = proxy_cfg
@@ -1202,7 +1226,6 @@ def main():
             login_ok = False
             for attempt in range(MAX_RETRIES):
                 print(f"\n🔄 验证码尝试 {attempt + 1}/{MAX_RETRIES}")
-                # 登录时 flow_name="login"，会继续执行点击复选框等完整逻辑
                 if process_captcha(page, flow_name="login"):
                     if wait_and_click(page, [
                         "button:has-text('Sign in')",
