@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-=============================================================================
-🎬 ACL Cloud 自动续期 & 服务器全生命周期管理脚本（完整无省略版 v7.7）
-=============================================================================
-包含功能：
-  1. 完整 UI 录屏：Xvfb 虚拟桌面 + ffmpeg 全程录屏。
-  2. 网络与代理：自动配置 GOST / SOCKS5 代理。
-  3. 电源与状态管理：开机 (Start)、关机 (Stop)、重启 (Reboot) 及状态检测。
-  4. 多语言适配：支持英语、法语、中文、西班牙语等界面的元素匹配。
-  5. 增强型 Anti-Bot OCR：自适应对比度增强 + 动态二值化 + 降噪微调。
-  6. 详尽 XPath 备选池：覆盖多种 UI 框架的输入框、按钮和弹窗。
-  7. 企业微信通知 & 完整诊断截图。
-=============================================================================
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.6）
+更新（v7.6）：
+  1. 【新增】支持配置代理服务器（PROXY_SERVER 环境变量）
+  2. 【优化】针对 Renew 弹窗（Anti-bot confirmation）优化 OCR 识别逻辑，处理背景干涉线
+  3. 【保持】其余逻辑（Xvfb、ffmpeg 录屏、网页交互、微信通知）完全一致
 """
 
 import os
@@ -23,23 +16,20 @@ import subprocess
 import signal
 import atexit
 import requests
-import re
 from datetime import datetime
-from urllib.parse import urljoin
-from PIL import Image, ImageEnhance, ImageFilter
+from urllib.parse import urljoin, urlparse
+from PIL import Image, ImageEnhance
 from io import BytesIO
 import pytesseract
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-# =============================================================================
-# 全局环境变量与基础配置
-# =============================================================================
+# ========== 配置 ==========
 USERNAME = os.getenv("ACL_USERNAME", "")
 PASSWORD = os.getenv("ACL_PASSWORD", "")
 LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
 WECHAT_WEBHOOK_KEY = os.getenv("WECHAT_WEBHOOK_KEY", "")
-SERVER_ID = os.getenv("ACL_SERVER_ID", "3727")
-POWER_TARGET_ACTION = os.getenv("POWER_ACTION", "none").lower()  # none, start, stop, restart, reboot
+SERVER_ID = os.getenv("ACL_SERVER_ID", "3727")   # 服务器 ID
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")     # 代理配置，如 "http://127.0.0.1:7890" 或 "http://user:pass@host:port"
 
 MAX_RETRIES = 3
 VIDEO_DIR = "videos"
@@ -47,74 +37,78 @@ RECORDING_FILE = "full_operation_recording.mp4"
 DIAGNOSTIC_PREFIX = "diag"
 DISPLAY_NUM = ":99"
 SCREEN_SIZE = "1920x1080x24"
+# ==========================
 
-# 代理配置
-SOCKS5_PROXY = os.getenv("SOCKS5_PROXY", os.getenv("GOST_LOCAL_PROXY", ""))
-
-# 全局运行状态追踪变量
 NEED_RENEWAL = False
 RENEWAL_SUCCESS = False
 SERVER_STATUS = "unknown"
-POWER_ACTION_RESULT = "none"
-SERVER_UPTIME = "unknown"
+POWER_ACTION = "none"
+SERVER_UPTIME = ""
 
 _xvfb_proc = None
 _ffmpeg_proc = None
 
-# =============================================================================
-# 多语言 Selector / XPath 详尽备选池
-# =============================================================================
-XPATH_LOGIN_USERNAMES = [
-    "//input[@name='email']", "//input[@type='email']",
-    "//input[@name='username']", "//input[@id='email']",
-    "//input[@id='username']", "//input[contains(@placeholder, 'email') or contains(@placeholder, 'Email')]",
-    "//input[contains(@placeholder, 'username') or contains(@placeholder, 'Username')]",
-    "//input[contains(@placeholder, '邮箱') or contains(@placeholder, '账号')]",
-    "//input[@autocomplete='username']", "//input[@autocomplete='email']"
-]
 
-XPATH_LOGIN_PASSWORDS = [
-    "//input[@name='password']", "//input[@type='password']",
-    "//input[@id='password']", "//input[contains(@placeholder, 'password') or contains(@placeholder, 'Password')]",
-    "//input[contains(@placeholder, '密码')]", "//input[@autocomplete='current-password']"
-]
+def download_image_bytes(page, src, label="图片"):
+    """
+    统一图片下载入口
+    - 相对路径使用 urljoin(page.url, src) 拼接
+    - 使用 page.context.request.get() 共享 Cookie/Session
+    - 支持 data:image Base64 内联图片
+    """
+    if not src:
+        print(f"     ⚠️ {label}: src 为空")
+        return None
 
-XPATH_LOGIN_SUBMIT_BTNS = [
-    "//button[@type='submit']", "//button[contains(., 'Sign in')]", "//button[contains(., 'Sign In')]",
-    "//button[contains(., 'Log in')]", "//button[contains(., 'Log In')]", "//button[contains(., 'Se connecter')]",
-    "//button[contains(., '登录')]", "//button[contains(., 'Iniciar sesión')]"
-]
+    try:
+        # 1) data URI 直接解码
+        if src.startswith("data:image"):
+            try:
+                _, b64data = src.split(",", 1)
+                return base64.b64decode(b64data)
+            except Exception as e:
+                print(f"     ⚠️ {label}: data URI 解码失败: {e}")
+                return None
 
-XPATH_RENEW_BTNS = [
-    "//button[contains(., 'Renew')]", "//button[contains(., 'renouveler') or contains(., 'Renouveler')]",
-    "//button[contains(., '续费') or contains(., '续期')]", "//button[contains(., 'Renovar')]",
-    "//a[contains(., 'Renew')]", "//div[contains(@class, 'renew')]//button"
-]
+        # 2) 拼接路径
+        full_url = urljoin(page.url, src)
 
-XPATH_POWER_START_BTNS = [
-    "//button[contains(., 'Start')]", "//button[contains(., 'Démarrer')]",
-    "//button[contains(., '开机') or contains(., '启动')]", "//button[contains(., 'Iniciar')]"
-]
+        # 3) 使用 context 请求，携带 Cookie
+        resp = page.context.request.get(full_url, timeout=15000)
+        if not resp.ok:
+            print(f"     ❌ {label}: HTTP {resp.status} {full_url}")
+            return None
+        body = resp.body()
+        if not body or len(body) < 100:
+            print(f"     ⚠️ {label}: 响应体过小 ({len(body) if body else 0} bytes) {full_url}")
+            return None
+        return body
+    except Exception as e:
+        print(f"     ❌ {label}: 下载失败: {e}")
+        return None
 
-XPATH_POWER_STOP_BTNS = [
-    "//button[contains(., 'Stop')]", "//button[contains(., 'Éteindre') or contains(., 'Arrêter')]",
-    "//button[contains(., '关机') or contains(., '停止')]", "//button[contains(., 'Detener')]"
-]
 
-XPATH_POWER_RESTART_BTNS = [
-    "//button[contains(., 'Restart') or contains(., 'Reboot')]", "//button[contains(., 'Redémarrer')]",
-    "//button[contains(., '重启') or contains(., '重新启动')]", "//button[contains(., 'Reiniciar')]"
-]
+def preprocess_captcha_image(img_bytes):
+    """优化 OCR 识别逻辑：针对带有干涉线条和噪点的验证码图片处理"""
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        # 1. 放大图片提升分辨率
+        w, h = img.size
+        img = img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
+        # 2. 转灰度图
+        gray = img.convert("L")
+        # 3. 增加对比度
+        enhancer = ImageEnhance.Contrast(gray)
+        gray = enhancer.enhance(2.5)
+        # 4. 二值化降噪处理
+        threshold = 140
+        binary = gray.point(lambda p: 255 if p > threshold else 0)
+        return binary
+    except Exception as e:
+        print(f"        ⚠️ 图片预处理失败: {e}")
+        return None
 
-XPATH_CONFIRM_DIALOG_BTNS = [
-    "//button[contains(., 'Confirm')]", "//button[contains(., 'Confirmer')]",
-    "//button[contains(., '确认') or contains(., '确定')]", "//button[contains(., 'Yes')]",
-    "//button[contains(., 'Oui')]", "//button[contains(., 'Aceptar')]"
-]
 
-# =============================================================================
-# 系统级辅助函数（虚拟桌面 / ffmpeg 录屏 / 进程管理）
-# =============================================================================
 def _kill_proc(proc, name="process", timeout=5):
     if proc is None or proc.poll() is not None:
         return
@@ -124,47 +118,60 @@ def _kill_proc(proc, name="process", timeout=5):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    print(f"⏹️  [{name}] 进程已终止")
+    print(f"⏹️  {name} 已终止")
+
 
 def start_xvfb():
     global _xvfb_proc
     if os.getenv("DISPLAY"):
-        print(f"ℹ️  检测到环境变量 DISPLAY={os.getenv('DISPLAY')}，跳过 Xvfb 启动")
+        print(f"ℹ️  已有 DISPLAY={os.getenv('DISPLAY')}")
         return
     print(f"🖥️  启动 Xvfb {DISPLAY_NUM} ({SCREEN_SIZE})...")
-    cmd = ["Xvfb", DISPLAY_NUM, "-screen", "0", SCREEN_SIZE, "-ac", "+extension", "RANDR", "-noreset"]
+    cmd = ["Xvfb", DISPLAY_NUM, "-screen", "0", SCREEN_SIZE,
+           "-ac", "+extension", "RANDR", "-noreset"]
     _xvfb_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.environ["DISPLAY"] = DISPLAY_NUM
     time.sleep(2)
     if _xvfb_proc.poll() is not None:
-        raise RuntimeError("❌ Xvfb 启动失败")
-    print("✅ Xvfb 启动成功")
+        raise RuntimeError("Xvfb 启动失败")
+    print(f"✅ Xvfb 已启动")
+
 
 def stop_xvfb():
     global _xvfb_proc
     _kill_proc(_xvfb_proc, "Xvfb")
     _xvfb_proc = None
 
+
 def start_ffmpeg_recording():
     global _ffmpeg_proc
     print(f"🎥 启动 ffmpeg 录屏 → {RECORDING_FILE}")
     cmd = [
-        "ffmpeg", "-f", "x11grab", "-video_size", "1920x1080",
-        "-i", DISPLAY_NUM, "-r", "10", "-pix_fmt", "yuv420p",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
-        "-movflags", "+faststart", "-y", RECORDING_FILE
+        "ffmpeg",
+        "-f", "x11grab",
+        "-video_size", "1920x1080",
+        "-i", DISPLAY_NUM,
+        "-r", "10",
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "30",
+        "-movflags", "+faststart",
+        "-y",
+        RECORDING_FILE
     ]
     _ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1)
     if _ffmpeg_proc.poll() is not None:
-        raise RuntimeError("❌ ffmpeg 启动失败")
-    print("✅ ffmpeg 录屏已就绪")
+        raise RuntimeError("ffmpeg 启动失败")
+    print("✅ ffmpeg 录屏已启动")
+
 
 def stop_ffmpeg_recording():
     global _ffmpeg_proc
     if _ffmpeg_proc is None:
         return
-    print("⏹️  结束 ffmpeg 录屏...")
+    print("⏹️  停止 ffmpeg 录屏...")
     try:
         _ffmpeg_proc.send_signal(signal.SIGTERM)
         _ffmpeg_proc.wait(timeout=8)
@@ -173,360 +180,645 @@ def stop_ffmpeg_recording():
     _ffmpeg_proc = None
     if os.path.exists(RECORDING_FILE):
         size_mb = os.path.getsize(RECORDING_FILE) / (1024 * 1024)
-        print(f"✅ 录屏已保存: {RECORDING_FILE} ({size_mb:.2f} MB)")
+        print(f"✅ 录屏已保存: {RECORDING_FILE} ({size_mb:.1f} MB)")
+
 
 def ensure_video_dir():
     if not os.path.exists(VIDEO_DIR):
         os.makedirs(VIDEO_DIR)
+        print(f"📁 视频目录: {VIDEO_DIR}")
+
 
 def diagnostic_screenshot(page, name):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = f"{VIDEO_DIR}/{DIAGNOSTIC_PREFIX}_{ts}_{name}.png"
     try:
         page.screenshot(path=path, full_page=True)
-        print(f"📸 诊断截图已保存: {path}")
+        print(f"📸 诊断截图: {path}")
     except Exception as e:
-        print(f"⚠️ 诊断截图抓取失败: {e}")
+        print(f"⚠️ 截图失败: {e}")
 
-# =============================================================================
-# OCR 核心增强与图像二值化微调算法
-# =============================================================================
-def preprocess_image_for_ocr(img_bytes):
-    """
-    对图片进行多阶段图像微调：自动对比度、锐化、高斯微降噪与自适应阈值二值化
-    """
-    try:
-        image = Image.open(BytesIO(img_bytes)).convert("L")
-        
-        # 1. 放大图片尺寸增强像素密度
-        w, h = image.size
-        image = image.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
 
-        # 2. 增强对比度与锐度
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(2.5)
-        image = image.filter(ImageFilter.SHARPEN)
-
-        # 3. 动态二值化处理
-        pixels = list(image.getdata())
-        avg_pixel = sum(pixels) / len(pixels)
-        threshold = int(avg_pixel * 0.95)
-        
-        binary_image = image.point(lambda p: 255 if p > threshold else 0)
-        return binary_image
-    except Exception as e:
-        print(f"     ⚠️ 图像预处理过程出错，回退到原始解析: {e}")
-        return Image.open(BytesIO(img_bytes))
-
-# =============================================================================
-# Web UI 辅助交互逻辑
-# =============================================================================
-def download_image_bytes(page, src, label="图片资源"):
-    if not src:
-        return None
-    try:
-        if src.startswith("data:image"):
-            _, b64data = src.split(",", 1)
-            return base64.b64decode(b64data)
-
-        full_url = urljoin(page.url, src)
-        resp = page.context.request.get(full_url, timeout=15000)
-        if not resp.ok:
-            return None
-        return resp.body()
-    except Exception as e:
-        print(f"     ❌ [{label}] 下载失败: {e}")
-        return None
-
-def scroll_page_to_bottom(page, step=600, pause=0.5, max_steps=15):
-    print("  📜 平滑滚动页面加载全部节点...")
+def scroll_page_to_bottom(page, step=600, pause=0.6, max_steps=20):
+    print("  📜 滚动页面加载全部内容...")
     try:
         for i in range(max_steps):
             page.mouse.wheel(0, step)
             time.sleep(pause)
-            height = page.evaluate("document.body ? document.body.scrollHeight : 0")
-            cur = page.evaluate("window.scrollY + window.innerHeight")
-            if height and cur >= height - 10:
+            try:
+                height = page.evaluate("document.body ? document.body.scrollHeight : 0")
+                cur = page.evaluate("window.scrollY + window.innerHeight")
+                if height and cur >= height - 10:
+                    print(f"  ✅ 已滚动到底部 (step {i + 1})")
+                    break
+            except Exception:
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠️ 滚动异常（忽略）: {e}")
+    time.sleep(1)
 
-def wait_and_type(page, xpath_list, value, label="输入框"):
-    print(f"  🔍 定位并填写: {label}...")
-    for xpath in xpath_list:
+
+def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
+    print(f"  🔍 查找 {label}...")
+    for sel in selectors:
         try:
-            loc = page.locator(f"xpath={xpath}").first
-            if loc.is_visible():
-                loc.click(timeout=3000)
-                loc.press("Control+a")
-                loc.press("Delete")
-                loc.type(value, delay=40)
-                print(f"     ✅ 输入成功 (XPath: {xpath})")
-                return True
-        except Exception:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=8000)
+            print(f"     ✅ 找到 {label}: '{sel}'")
+            loc.click(timeout=5000)
+            time.sleep(0.2)
+            loc.press("Control+a")
+            loc.press("Delete")
+            time.sleep(0.2)
+            loc.type(value, delay=delay_ms, timeout=15000)
+            print(f"     ✅ {label} 输入完成")
+            return True
+        except PlaywrightTimeout:
+            print(f"     ⏱️ 选择器 '{sel}' 等待超时")
+            continue
+        except Exception as e:
+            print(f"     ❌ 选择器 '{sel}': {str(e)[:80]}")
+            continue
+    print(f"  ⚠️ 常规输入失败，尝试 JavaScript 兜底...")
+    for sel in selectors:
+        try:
+            page.wait_for_selector(sel, state="attached", timeout=5000)
+            page.evaluate(f"""
+                (() => {{
+                    const el = document.querySelector('{sel}');
+                    if (!el) return false;
+                    el.value = '{value}';
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('keyup', {{ bubbles: true }}));
+                    return true;
+                }})()
+            """)
+            print(f"     ✅ JS 兜底成功: '{sel}'")
+            return True
+        except Exception as e:
+            print(f"     ❌ JS 兜底失败 '{sel}': {e}")
             continue
     return False
 
-def wait_and_click(page, xpath_list, label="按钮", timeout=5000):
-    print(f"  🔍 定位并点击: {label}...")
-    for xpath in xpath_list:
+
+def wait_and_click(page, selectors, label="按钮", timeout=8000):
+    print(f"  🔍 查找 {label}...")
+    for sel in selectors:
         try:
-            loc = page.locator(f"xpath={xpath}").first
+            loc = page.locator(sel).first
             loc.wait_for(state="visible", timeout=timeout)
             loc.scroll_into_view_if_needed()
-            loc.click(force=True)
-            print(f"     ✅ 点击成功 (XPath: {xpath})")
+            time.sleep(0.3)
+            loc.click(timeout=5000)
+            print(f"     ✅ 点击 {label}: '{sel}'")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"     ❌ '{sel}': {str(e)[:80]}")
             continue
     return False
 
-def close_install_popup(page):
-    close_xpaths = [
-        "//button[contains(., 'Fermer')]", "//button[contains(., 'Close')]",
-        "//button[contains(., '关闭')]", "//button[contains(@class, 'close')]",
-        "//div[contains(@class, 'pwa')]//button"
-    ]
-    for xp in close_xpaths:
+
+def safe_find_text(page, selectors, default=""):
+    for sel in selectors:
         try:
-            btns = page.locator(f"xpath={xp}").all()
-            for btn in btns:
-                if btn.is_visible():
-                    btn.click()
-                    print("✅ 已关闭阻挡弹窗")
-                    time.sleep(0.5)
-                    return True
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1000):
+                return loc.inner_text().strip()
         except Exception:
-            pass
+            continue
+    return default
+
+
+def close_install_popup(page):
+    try:
+        selectors = [
+            "//button[contains(text(), 'Fermer')]",
+            "//button[contains(text(), 'Close')]",
+            "//div[contains(@class, 'pwa-install')]//button[1]",
+            "//div[contains(@class, 'install-popup')]//button[contains(@class, 'close')]"
+        ]
+        for sel in selectors:
+            try:
+                btns = page.locator(sel).all()
+                for btn in btns:
+                    if btn.is_visible():
+                        btn.click()
+                        print("✅ 已关闭安装弹窗")
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"ℹ️ 无需关闭弹窗: {e}")
     return False
 
-# =============================================================================
-# 核心业务：Anti-Bot 验证突破与续期
-# =============================================================================
+
+def wait_for_login_page(page, url):
+    print(f"\n🌐 打开登录页: {url}")
+    for attempt in range(3):
+        try:
+            page.goto(url, wait_until="networkidle", timeout=45000)
+            print(f"  ✅ 页面 networkidle")
+            time.sleep(3)
+            selectors = [
+                "input[name='email']", "input[type='email']",
+                "input[placeholder*='email' i]", "input[name='username']",
+                "input[id*='email' i]", "input[id='email']",
+                "input[autocomplete='username']", "input[autocomplete='email']",
+            ]
+            for sel in selectors:
+                try:
+                    page.wait_for_selector(sel, state="visible", timeout=5000)
+                    print(f"  ✅ 登录表单已就绪: '{sel}'")
+                    return True
+                except Exception:
+                    continue
+            print(f"  ⚠️ 第 {attempt + 1} 次：表单未就绪，重试...")
+            diagnostic_screenshot(page, f"login_retry_{attempt + 1}")
+            time.sleep(3)
+        except Exception as e:
+            print(f"  ❌ 第 {attempt + 1} 次加载失败: {e}")
+            diagnostic_screenshot(page, f"load_error_{attempt + 1}")
+            time.sleep(3)
+    return False
+
+
 def process_captcha(page, flow_name=""):
-    print(f"\n🔄 启动 Anti-Bot 验证校验 [{flow_name}]...")
+    """
+    处理人机验证（Anti-bot confirmation 弹窗 OCR 识别并点击）
+    """
+    print(f"\n🔄 开始处理{flow_name}人机验证...")
+
+    # 如果有复选框先尝试点击复选框
     try:
-        page.wait_for_load_state("networkidle", timeout=6000)
+        checkbox = page.locator(
+            "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"
+        ).first
+        if checkbox.is_visible(timeout=3000):
+            checkbox.hover()
+            time.sleep(0.3)
+            checkbox.click()
+            time.sleep(1.5)
+            print("  ✅ 复选框已点击")
     except Exception:
         pass
 
-    popup_xpaths = [
-        "//div[contains(., 'Anti-bot confirmation')]",
-        "//div[contains(@class, 'auth-captcha')]",
-        "//div[contains(@class, 'modal') and contains(., 'Confirm')]"
+    # 1. 获取提示文字（如 Click on ACLClouds）
+    strong_text = ""
+    prompt_selectors = [
+        "div.auth-captcha-prompt", ".captcha-prompt",
+        "//p[contains(text(), 'Click on')]", "//div[contains(text(), 'Click on')]"
     ]
-    
-    for xp in popup_xpaths:
+    for p_sel in prompt_selectors:
         try:
-            page.wait_for_selector(f"xpath={xp}", state="visible", timeout=8000)
-            break
+            prompt = page.locator(p_sel).first
+            if prompt.is_visible(timeout=3000):
+                if prompt.locator("strong").count() > 0:
+                    strong_text = prompt.locator("strong").inner_text().strip()
+                else:
+                    text_content = prompt.inner_text().strip()
+                    if "Click on" in text_content:
+                        strong_text = text_content.split("Click on")[-1].strip()
+                if strong_text:
+                    break
         except Exception:
             continue
 
-    checkbox_xpaths = [
-        "//div[contains(@class, 'auth-captcha-checkbox')]",
-        "//input[@type='checkbox']/following-sibling::label",
-        "//span[contains(@class, 'captcha-checkbox')]"
+    if not strong_text:
+        print("  ⚠️ 获取提示文字失败")
+        return False
+
+    print(f"  📝 验证码提示目标文字: {strong_text}")
+    target = strong_text.lower().replace(" ", "").replace("-", "")
+
+    # 2. 定位图片选项列表
+    option_selectors = [
+        "div.auth-captcha-options button", ".captcha-options .captcha-option",
+        "button.auth-captcha-option", ".captcha-option",
+        "//div[contains(@class, 'modal')]//img/ancestor::button",
+        "//div[contains(@class, 'modal')]//img/parent::div",
+        "img[src*='captcha']", "div:has(> img)"
     ]
-    
-    cb_found = False
-    for cb_xp in checkbox_xpaths:
+
+    options = []
+    for opt_sel in option_selectors:
         try:
-            cb = page.locator(f"xpath={cb_xp}").first
-            if cb.is_visible():
-                cb.hover()
-                cb.click(force=True)
-                cb_found = True
-                print("  ✅ 验证码复选框已勾选")
+            found = page.locator(opt_sel).all()
+            visible_opts = [o for o in found if o.is_visible()]
+            if len(visible_opts) >= 2:
+                options = visible_opts
                 break
         except Exception:
             continue
 
-    if not cb_found:
-        print("  ⚠️ 未找到可勾选的验证码复选框")
+    if not options:
+        print("  ⚠️ 未找到可点击的图片选项")
+        return False
+
+    print(f"  📍 共找到 {len(options)} 个候选选项")
+    clicked = False
+
+    # 3. OCR 识别选项图片
+    for idx, opt in enumerate(options):
+        try:
+            # 尝试找 img 标签
+            if opt.evaluate("node => node.tagName.toLowerCase()") == "img":
+                img = opt
+            else:
+                img = opt.locator("img").first
+
+            src = img.get_attribute("src") if img.is_visible() else ""
+            img_bytes = download_image_bytes(page, src, label=f"选项 {idx + 1}")
+            if img_bytes is None:
+                continue
+
+            # 处理图片 & OCR 识别
+            processed_img = preprocess_captcha_image(img_bytes)
+            if not processed_img:
+                continue
+
+            ocr_text = pytesseract.image_to_string(
+                processed_img, lang='eng', config='--psm 7 --oem 3 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            ).strip()
+            
+            ocr_clean = ocr_text.lower().replace(" ", "").replace("-", "")
+            print(f"     📍 选项 {idx + 1} OCR: '{ocr_text}' → 清洗: '{ocr_clean}'")
+
+            # 比对关键词
+            if target in ocr_clean or ocr_clean in target:
+                print(f"  ✅ 成功匹配选项 {idx + 1} (目标: {strong_text} | OCR: {ocr_text})")
+                opt.scroll_into_view_if_needed()
+                time.sleep(0.3)
+                opt.click()
+                clicked = True
+                time.sleep(2)
+                break
+        except Exception as e:
+            print(f"     ❌ 选项 {idx + 1} 识别/点击出错: {e}")
+
+    if not clicked:
+        print("  ❌ 未匹配到对应的文字选项")
         return False
 
     time.sleep(2)
-
-    # 提取题目提示词
+    # 验证弹窗是否顺利关闭或成功
     try:
-        prompt_loc = page.locator("css=div.auth-captcha-prompt strong, .captcha-prompt strong").first
-        prompt_loc.wait_for(state="visible", timeout=8000)
-        target_text = prompt_loc.inner_text().strip()
-        print(f"  📝 目标识别提示词: [{target_text}]")
-    except Exception as e:
-        print(f"  ⚠️ 获取提示词失败: {e}")
-        return False
-
-    # 提取多项候选图片
-    try:
-        options = page.locator("css=div.auth-captcha-options button, .captcha-option").all()
-        if not options:
-            return False
-    except Exception:
-        return False
-
-    target_clean = re.sub(r'[^a-zA-Z0-9]', '', target_text.lower())
-    for idx, btn in enumerate(options):
-        try:
-            img = btn.locator("css=img").first
-            src = img.get_attribute("src")
-            img_bytes = download_image_bytes(page, src, label=f"选项 {idx+1}")
-            if not img_bytes:
-                continue
-
-            processed_img = preprocess_image_for_ocr(img_bytes)
-            ocr_text = pytesseract.image_to_string(processed_img, lang='eng', config='--psm 7').strip()
-            ocr_clean = re.sub(r'[^a-zA-Z0-9]', '', ocr_text.lower())
-            
-            print(f"     📍 选项 {idx+1} OCR: '{ocr_text}' → 清洗后: '{ocr_clean}'")
-
-            if target_clean in ocr_clean or ocr_clean in target_clean:
-                print(f"  🎯 精确匹配成功，点击选项 [{idx+1}]")
-                btn.scroll_into_view_if_needed()
-                btn.click()
-                time.sleep(2)
+        verified = page.locator("span.auth-captcha-label, .captcha-label").first
+        if verified.is_visible():
+            vtext = verified.inner_text()
+            if "Verified" in vtext or "Vérifié" in vtext:
+                print(f"  ✅ 验证通过 (Verified: {vtext})")
                 return True
-        except Exception as e:
-            print(f"     ❌ 选项 {idx+1} 处理异常: {e}")
+    except Exception:
+        pass
+
+    return True
+
+
+def check_login_success(page, timeout=20):
+    print(f"  ⏳ 等待登录跳转/渲染（最多 {timeout} 秒）...")
+    start_time = time.time()
+    last_url = page.url
+
+    while time.time() - start_time < timeout:
+        current_url = page.url
+        if "login" not in current_url.lower() and "/auth/" not in current_url.lower():
+            print(f"  🎉 登录成功（URL）: {current_url}")
+            return True
+
+        try:
+            dashboard_indicators = [
+                "text=Bienvenue", "text=Dashboard", "text=Tableau de bord",
+                "text=Accueil", "text=Mes services", "text=My services",
+                "a[href='/dashboard']", "a[href='/logout']",
+                "[class*='dashboard']", "nav"
+            ]
+            for sel in dashboard_indicators:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=500):
+                        print(f"  🎉 登录成功（内容: '{sel}'）URL: {current_url}")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    final_url = page.url
+    if "login" not in final_url.lower() and "/auth/" not in final_url.lower():
+        print(f"  🎉 登录成功（最终 URL）: {final_url}")
+        return True
 
     return False
 
+
+def switch_language_to_en(page):
+    print("\n🌐 检查并切换语言为 English...")
+
+    lang_button = None
+    lang_selectors = [
+        "button[aria-label='Langue']",
+        "button[class*='LanguageButton']",
+        "button[class*='language']",
+        "//button[@aria-label='Langue']",
+        "//button[contains(@class, 'LanguageButton')]",
+        "//button[.//img[contains(@src, 'flags')]]",
+        "//button[.//span[contains(@class, 'lang-code')]]",
+    ]
+
+    for sel in lang_selectors:
+        try:
+            loc = page.locator(f"xpath={sel}").first if sel.startswith("//") else page.locator(sel).first
+            if loc.is_visible(timeout=3000):
+                lang_button = loc
+                break
+        except Exception:
+            continue
+
+    if not lang_button:
+        print("⚠️ 未找到语言切换按钮，跳过")
+        return False
+
+    current_lang = ""
+    try:
+        badge = lang_button.locator(".lang-code-badge").first
+        current_lang = badge.inner_text().strip().upper()
+    except Exception:
+        pass
+
+    if "EN" in current_lang:
+        print("✅ 当前语言已是 English，无需切换")
+        return True
+
+    lang_button.scroll_into_view_if_needed()
+    time.sleep(0.3)
+    lang_button.click()
+    time.sleep(1.5)
+
+    en_option = None
+    en_selectors = [
+        "button:has-text('English'):has-text('EN')",
+        "//button[contains(text(), 'English')]",
+    ]
+
+    for sel in en_selectors:
+        try:
+            loc = page.locator(f"xpath={sel}").first if sel.startswith("//") else page.locator(sel).first
+            if loc.is_visible(timeout=3000):
+                en_option = loc
+                break
+        except Exception:
+            continue
+
+    if en_option:
+        en_option.click()
+        print("✅ 已点击 English 语言选项")
+        time.sleep(3)
+        return True
+
+    return False
+
+
+def needs_renewal(status_text):
+    if not status_text:
+        return False
+    status_lower = status_text.lower()
+    keywords = [
+        "suspended", "expired", "suspendu", "expire", "termine",
+        "inactive", "inactif", "ended", "non actif", "renouvellement",
+        "renewal", "renouveler", "renew"
+    ]
+    return any(kw in status_lower for kw in keywords)
+
+
 def perform_renewal(page):
     global NEED_RENEWAL, RENEWAL_SUCCESS
-    print("\n🔄 扫描续期按钮...")
+    print("\n🔄 开始执行续期操作...")
     close_install_popup(page)
     scroll_page_to_bottom(page)
 
-    for xp in XPATH_RENEW_BTNS:
+    renew_buttons = []
+    for sel in [
+        "button:has-text('Renew')",
+        "button:has-text('Renouveler')",
+        "//button[span[normalize-space()='Renew']]",
+        "//button[normalize-space()='Renew']",
+    ]:
         try:
-            btns = [b for b in page.locator(f"xpath={xp}").all() if b.is_visible()]
+            loc = page.locator(f"xpath={sel}") if sel.startswith("//") else page.locator(sel)
+            btns = [b for b in loc.all() if b.is_visible()]
             if btns:
-                NEED_RENEWAL = True
-                print(f"📋 发现 {len(btns)} 个可续期项目")
-                for btn in btns:
-                    btn.click(force=True)
-                    time.sleep(3)
-                    if process_captcha(page, flow_name="renewal"):
-                        RENEWAL_SUCCESS = True
-                        print("✅ 续期顺利完成")
-                    else:
-                        RENEWAL_SUCCESS = False
-                        return False
+                renew_buttons = btns
+                print(f"📋 找到 {len(btns)} 个 Renew 按钮 (selector: {sel})")
+                break
+        except Exception:
+            continue
+
+    if not renew_buttons:
+        print("ℹ️ 页面上没有可见的 Renew 按钮，无需续期")
+        return True
+
+    for idx, btn in enumerate(renew_buttons):
+        try:
+            NEED_RENEWAL = True
+            btn.scroll_into_view_if_needed()
+            time.sleep(0.5)
+            btn.click()
+            print(f"  ✅ 已点击 Renew 按钮")
+            time.sleep(2)
+
+            if process_captcha(page, flow_name="renewal_popup"):
+                RENEWAL_SUCCESS = True
+                print("✅ 续期验证通过！")
+            else:
+                print("❌ 续期验证失败")
+            time.sleep(2)
+            close_install_popup(page)
+        except Exception as e:
+            print(f"  ❌ 处理 Renew 按钮 {idx + 1} 出错: {e}")
+            continue
+
+    return True
+
+
+def navigate_to_services(page):
+    print("\n📂 点击 My services / Mes services 导航...")
+    nav_selectors = [
+        "a[aria-label='My services']",
+        "a[href='/dashboard/projects']",
+        "//a[contains(@aria-label, 'My services')]",
+        "text=Mes services",
+        "text=My services"
+    ]
+
+    for sel in nav_selectors:
+        try:
+            loc = page.locator(f"xpath={sel}").first if sel.startswith("//") else page.locator(sel).first
+            if loc.is_visible(timeout=3000):
+                loc.click()
+                time.sleep(3)
+                print("✅ 已进入 My services 页面")
                 return True
         except Exception:
             continue
 
-    print("ℹ️ 未发现需要续期的服务")
+    print("⚠️ 未找到导航按钮，直接访问 URL")
+    page.goto("https://aclclouds.com/dashboard/projects", wait_until="networkidle")
+    time.sleep(3)
     return True
 
-# =============================================================================
-# 服务器关机 / 开机 / 重启 / 运行状态检测逻辑
-# =============================================================================
-def manage_server_power_and_status(page):
-    """
-    检查服务器当前运行状态，并根据环境变量执行指定的开机/关机/重启操作
-    """
-    global SERVER_STATUS, POWER_ACTION_RESULT, SERVER_UPTIME
-    print(f"\n🖥️ 正在进入服务器 [{SERVER_ID}] 详情页与电源管理...")
-    
+
+def click_manage_button(page):
+    print("\n🔧 点击 Manage / Gerer 按钮...")
+    manage_selectors = [
+        "a.client-btn--primary[href^='/server/']",
+        "a[href^='/server/'].client-btn",
+        "//a[contains(@href, '/server/')]",
+        "a:has-text('Manage')",
+        "a:has-text('Gerer')",
+    ]
+
+    for sel in manage_selectors:
+        try:
+            loc = page.locator(f"xpath={sel}").first if sel.startswith("//") else page.locator(sel).first
+            if loc.is_visible(timeout=3000):
+                loc.scroll_into_view_if_needed()
+                time.sleep(0.5)
+                loc.click()
+                time.sleep(3)
+                print("✅ 已进入服务器详情页")
+                return True
+        except Exception:
+            continue
+
+    fallback_url = f"https://aclclouds.com/server/{SERVER_ID}"
+    print(f"⚠️ 未找到 Manage 按钮，直接访问服务器详情页: {fallback_url}")
     try:
-        page.goto(f"https://aclclouds.com/server/{SERVER_ID}", wait_until="networkidle", timeout=30000)
-        time.sleep(2)
+        page.goto(fallback_url, wait_until="networkidle", timeout=45000)
+        time.sleep(3)
+        return True
     except Exception as e:
-        print(f"⚠️ 无法正常载入服务器详情页: {e}")
-        return
-
-    # 1. 检测当前服务器状态 (Online / Offline / Stopped / Running)
-    try:
-        status_xpath = "//span[contains(@class, 'status') or contains(@class, 'badge')]"
-        status_elements = page.locator(f"xpath={status_xpath}").all()
-        for elem in status_elements:
-            if elem.is_visible():
-                txt = elem.inner_text().strip()
-                if txt:
-                    SERVER_STATUS = txt
-                    break
-        print(f"  📊 当前实例监测状态: [{SERVER_STATUS}]")
-    except Exception as e:
-        print(f"  ⚠️ 读取运行状态出错: {e}")
-
-    # 2. 根据目标 POWER_TARGET_ACTION 执行电源动作
-    if POWER_TARGET_ACTION in ["start", "open", "开机"]:
-        print("  ⚡ 触发【开机】操作...")
-        if wait_and_click(page, XPATH_POWER_START_BTNS, label="开机按钮"):
-            wait_and_click(page, XPATH_CONFIRM_DIALOG_BTNS, label="二次确认")
-            POWER_ACTION_RESULT = "start_requested"
-            
-    elif POWER_TARGET_ACTION in ["stop", "shutdown", "关机"]:
-        print("  ⚡ 触发【关机】操作...")
-        if wait_and_click(page, XPATH_POWER_STOP_BTNS, label="关机按钮"):
-            wait_and_click(page, XPATH_CONFIRM_DIALOG_BTNS, label="二次确认")
-            POWER_ACTION_RESULT = "stop_requested"
-
-    elif POWER_TARGET_ACTION in ["restart", "reboot", "重启"]:
-        print("  ⚡ 触发【重启】操作...")
-        if wait_and_click(page, XPATH_POWER_RESTART_BTNS, label="重启按钮"):
-            wait_and_click(page, XPATH_CONFIRM_DIALOG_BTNS, label="二次确认")
-            POWER_ACTION_RESULT = "restart_requested"
-    else:
-        print("  ℹ️ 未配置任何电源变更操作（POWER_ACTION=none）")
-
-    time.sleep(3)
-
-# =============================================================================
-# 通知机制
-# =============================================================================
-def send_wechat_notification(need_renewal, renewal_success, error_msg=""):
-    if not WECHAT_WEBHOOK_KEY:
+        print(f"❌ 直接访问详情页失败: {e}")
         return False
 
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_WEBHOOK_KEY}"
 
-    if error_msg:
-        color = "🔴"
-        status_text = "脚本运行报错"
-        detail = f"错误原因: {error_msg}"
-    elif need_renewal and renewal_success:
-        color = "🟢"
-        status_text = "续期成功"
-        detail = "已成功突破人机验证并完成续期"
-    elif need_renewal and not renewal_success:
-        color = "🔴"
-        status_text = "续期失败"
-        detail = "人机验证未能通过，请登录后台手动处理"
-    else:
-        color = "🟢"
-        status_text = "状态正常"
-        detail = "无需续期"
+def find_label_value(page, labels):
+    for label in labels:
+        xpaths = [
+            f"//*[contains(normalize-space(text()), '{label}')]/following-sibling::*[1]",
+            f"//*[contains(normalize-space(text()), '{label}')]/parent::*//following-sibling::*[1]",
+        ]
+        for xp in xpaths:
+            try:
+                loc = page.locator(f"xpath={xp}").first
+                if loc.is_visible(timeout=800):
+                    value = loc.inner_text().strip()
+                    if value and label.lower() not in value.lower():
+                        return value
+            except Exception:
+                continue
+    return ""
 
-    msg = f"""{color} ACL Cloud 控制台报告 {color}
 
-🖥️ 目标 Server ID: {SERVER_ID}
-📊 服务器当前状态: {SERVER_STATUS}
-⚡ 电源指令结果: {POWER_ACTION_RESULT}
-📌 续期任务状态: {status_text}
-📝 详细信息: {detail}
-⏱️ 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+def get_server_info(page):
+    global SERVER_STATUS, SERVER_UPTIME
+    print("\n📊 获取服务器信息...")
+    info = {
+        "time_remaining": "",
+        "plan": "",
+        "renewal_note": "",
+        "server_name": "",
+        "server_url": page.url,
+        "status": "unknown",
+        "uptime": "",
+    }
+
+    try:
+        info["server_name"] = page.locator("h1, .server-name, [class*='server-title']").first.inner_text(timeout=3000).strip()
+    except Exception:
+        info["server_name"] = "ACL Cloud Server"
+
+    uptime_value = find_label_value(page, ["Uptime", "Temps de fonctionnement", "Running for"])
+    if uptime_value:
+        info["uptime"] = uptime_value
+        SERVER_UPTIME = uptime_value
+        info["status"] = SERVER_STATUS = "online"
+
+    info["time_remaining"] = find_label_value(page, ["Time remaining", "Temps restant"])
+    info["plan"] = find_label_value(page, ["Plan", "Forfait"])
+
+    diagnostic_screenshot(page, "server_info")
+    return info
+
+
+def manage_server_power(page):
+    global POWER_ACTION, SERVER_UPTIME
+    print("\n⚡ 检测服务器电源状态并执行操作...")
+
+    if SERVER_UPTIME:
+        print(f"🟢 服务器 Online（运行时间: {SERVER_UPTIME}），不执行重启")
+        POWER_ACTION = "none"
+        return True
+
+    print("🔴 未检测到运行时间，服务器可能 Offline，执行 Start...")
+    if wait_and_click(page, [
+        "button:has-text('Start')",
+        "button:has-text('Démarrer')",
+        "//button[contains(translate(., 'START', 'start'), 'start')]",
+    ], label="Start 按钮"):
+        POWER_ACTION = "start"
+        print("✅ Start 已点击")
+        return True
+
+    return False
+
+
+def send_wechat_notification(info, need_renewal, renewal_success, power_action):
+    if not WECHAT_WEBHOOK_KEY:
+        print("⚠️ 未设置 WECHAT_WEBHOOK_KEY，跳过通知")
+        return False
+
+    webhook_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECHAT_WEBHOOK_KEY}"
+    server_name = info.get("server_name", "ACL Cloud Server")
+    time_remaining = info.get("time_remaining", "未知")
+    plan = info.get("plan", "未知")
+    status = info.get("status", "unknown")
+    uptime = info.get("uptime", SERVER_UPTIME or "未知")
+
+    content = f"""ACL Cloud 服务器状态报告
+
+📌 服务器: {server_name}
+⏱️ 运行时间: {uptime}
+⏰ 剩余时间: {time_remaining}
+📋 套餐信息: {plan}
+
+📊 续期状态: {'✅ 成功' if renewal_success else ('❌ 失败' if need_renewal else '✅ 无需续期')}
+⚡ 电源动作: {power_action}
+
+⏱️ 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
 
     try:
-        requests.post(url, json={"msgtype": "text", "text": {"content": msg}}, timeout=10)
-        print("✅ 企业微信通知推送成功")
+        requests.post(webhook_url, json={"msgtype": "text", "text": {"content": content}}, timeout=10)
+        print("✅ 企业微信通知发送成功")
+        return True
     except Exception as e:
-        print(f"❌ 微信推送异常: {e}")
+        print(f"❌ 发送通知异常: {e}")
+        return False
 
-# =============================================================================
-# 主程序入口
-# =============================================================================
+
 def main():
-    global NEED_RENEWAL, RENEWAL_SUCCESS
+    global NEED_RENEWAL, RENEWAL_SUCCESS, SERVER_STATUS, POWER_ACTION, SERVER_UPTIME
 
     if not USERNAME or not PASSWORD:
-        print("❌ 未配置 ACL_USERNAME 或 ACL_PASSWORD")
+        print("❌ 错误: 未设置 ACL_USERNAME 或 ACL_PASSWORD")
         sys.exit(1)
 
     ensure_video_dir()
+    server_info = {}
     page = None
     context = None
     browser = None
@@ -539,71 +831,99 @@ def main():
 
     with sync_playwright() as p:
         try:
+            print("🚀 启动 Chromium 浏览器...")
+            
+            # 配置代理（如果环境变量 PROXY_SERVER 已设置）
             launch_args = {
                 "headless": False,
-                "args": ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1920,1080",
+                    "--start-maximized",
+                ]
             }
 
-            if SOCKS5_PROXY:
-                print(f"🌐 配置 SOCKS5 代理: {SOCKS5_PROXY}")
-                launch_args["proxy"] = {"server": SOCKS5_PROXY}
+            if PROXY_SERVER:
+                print(f"🌐 正在使用代理服务器: {PROXY_SERVER}")
+                parsed_proxy = urlparse(PROXY_SERVER)
+                proxy_config = {"server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"}
+                if parsed_proxy.username and parsed_proxy.password:
+                    proxy_config["username"] = parsed_proxy.username
+                    proxy_config["password"] = parsed_proxy.password
+                launch_args["proxy"] = proxy_config
 
             browser = p.chromium.launch(**launch_args)
+
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             page = context.new_page()
 
-            # 1. 打开登录页面
-            print(f"\n🌐 打开登录地址: {LOGIN_URL}")
-            page.goto(LOGIN_URL, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
+            if not wait_for_login_page(page, LOGIN_URL):
+                print("❌ 登录页加载失败")
+                return False
 
-            # 2. 填写登录凭据
-            if not wait_and_type(page, XPATH_LOGIN_USERNAMES, USERNAME, label="账号"):
-                raise RuntimeError("无法找到账号输入框")
-            if not wait_and_type(page, XPATH_LOGIN_PASSWORDS, PASSWORD, label="密码"):
-                raise RuntimeError("无法找到密码输入框")
+            wait_and_type(page, ["input[name='email']", "input[type='email']"], USERNAME, label="邮箱输入框")
+            wait_and_type(page, ["input[name='password']", "input[type='password']"], PASSWORD, label="密码输入框")
 
-            # 3. 执行登录与人机验证
-            login_success = False
+            login_ok = False
             for attempt in range(MAX_RETRIES):
-                print(f"\n🔄 尝试登录验证 ({attempt + 1}/{MAX_RETRIES})...")
+                print(f"\n🔄 验证码尝试 {attempt + 1}/{MAX_RETRIES}")
                 if process_captcha(page, flow_name="login"):
-                    if wait_and_click(page, XPATH_LOGIN_SUBMIT_BTNS, label="登录按钮"):
-                        time.sleep(5)
-                        if "login" not in page.url.lower():
-                            login_success = True
-                            print("🎉 登录成功")
+                    if wait_and_click(page, ["button:has-text('Sign in')", "button[type='submit']"], label="Sign in 按钮"):
+                        if check_login_success(page, timeout=20):
+                            login_ok = True
                             break
-            if not login_success:
-                raise RuntimeError("登录验证未能顺利通过")
+                time.sleep(2)
+
+            if not login_ok:
+                print("❌ 登录失败")
+                return False
+
+            base_url = LOGIN_URL.rstrip("/auth/login").rstrip("/")
+            if "dashboard" not in page.url.lower():
+                page.goto(base_url + "/dashboard", wait_until="networkidle")
 
             close_install_popup(page)
+            switch_language_to_en(page)
 
-            # 4. 执行续期
-            perform_renewal(page)
+            # 检测与执行续期
+            scroll_page_to_bottom(page)
+            renew_btns = page.locator("button:has-text('Renew'), button:has-text('Renouveler')").all()
+            visible_renew = [b for b in renew_btns if b.is_visible()]
 
-            # 5. 服务器电源状态与控制逻辑
-            manage_server_power_and_status(page)
+            if visible_renew:
+                print("\n📌 执行续期流程...")
+                perform_renewal(page)
 
-            # 6. 发送通知
-            send_wechat_notification(NEED_RENEWAL, RENEWAL_SUCCESS)
-            print("\n🎉 全部自动化任务执行完成")
+            navigate_to_services(page)
+            click_manage_button(page)
+            server_info = get_server_info(page)
+            manage_server_power(page)
+
+            send_wechat_notification(server_info, NEED_RENEWAL, RENEWAL_SUCCESS, POWER_ACTION)
+
+            print("\n🎉 所有操作已完成！")
+            return True
 
         except Exception as e:
-            print(f"\n❌ 执行报错: {e}")
-            if page:
-                diagnostic_screenshot(page, "fatal_error")
-            send_wechat_notification(NEED_RENEWAL, False, error_msg=str(e))
-            sys.exit(1)
+            print(f"\n❌ 发生错误: {e}")
+            return False
 
         finally:
             try:
-                if context: context.close()
-                if browser: browser.close()
+                if context:
+                    context.close()
+                if browser:
+                    browser.close()
             except Exception:
                 pass
+
             stop_ffmpeg_recording()
             stop_xvfb()
 
+
 if __name__ == "__main__":
-    main()
+    success = main()
+    sys.exit(0 if success else 1)
