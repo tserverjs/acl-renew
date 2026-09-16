@@ -1,6 +1,6 @@
 # =============================================================================
-# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright + Xvfb + ffmpeg 完整录屏版）
-#    可录制完整浏览器 UI（地址栏、最大化/最小化/关闭按钮）
+# 🎬 ACL Cloud 自动续期 & 服务器管理（Playwright + Xvfb + ffmpeg 完整录屏版 + GOST代理）
+#   支持通过 GOST 代理隧道访问目标站点并录制完整 UI 过程
 # =============================================================================
 
 name: 🎬 ACL Cloud 自动续期 · 完整浏览器录屏
@@ -30,7 +30,7 @@ jobs:
   auto-renewal:
     name: 🎭 完整浏览器录屏自动化
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - name: 📥 检出仓库代码
@@ -54,6 +54,39 @@ jobs:
             libglib2.0-0
           echo "✅ 系统依赖安装完成"
 
+      - name: 🌐 启动 GOST 代理隧道
+        env:
+          GOST_PROXY: ${{ secrets.GOST_PROXY }}
+        run: |
+          if [ -z "${GOST_PROXY}" ]; then
+            echo "❌ 致命错误: 未在仓库配置 secrets.GOST_PROXY"
+            exit 1
+          fi
+
+          echo "⬇️  获取 GOST 最新版本并下载..."
+          GOST_VERSION=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+          echo "📦 GOST 版本: $GOST_VERSION"
+
+          wget -q "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+          tar -xzf gost_${GOST_VERSION}_linux_amd64.tar.gz
+          chmod +x ./gost
+
+          echo "🚀 启动 GOST 本地转发 (SOCKS5 服务端口: 40000)..."
+          nohup ./gost -L socks5://:40000 -F "${GOST_PROXY}" > gost.log 2>&1 &
+
+          sleep 6
+
+          echo "🔍 测试 GOST 代理连接状态..."
+          EXIT_IP=$(curl -s --max-time 10 --proxy socks5://127.0.0.1:40000 https://api.ipify.org || true)
+
+          if [ -z "${EXIT_IP}" ]; then
+            echo "❌ 代理隧道连接失败，正在打印 gost 日志..."
+            cat gost.log
+            exit 1
+          fi
+
+          echo "✅ GOST 代理隧道已就绪，当前代理出口 IP: ${EXIT_IP}"
+
       - name: 🐍 配置 Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -71,7 +104,7 @@ jobs:
       - name: 🔍 验证运行环境
         run: |
           echo "┌──────────────────────────────────────────┐"
-          echo "│           🔍 环境验证报告                 │"
+          echo "│            🔍 环境验证报告               │"
           echo "├──────────────────────────────────────────┤"
           echo -n "│ Xvfb          "
           xvfb-run --auto-servernum -- echo "✅ 正常" || echo "❌ 异常"
@@ -87,14 +120,16 @@ jobs:
           tesseract --version 2>/dev/null | head -1 | awk '{print "✅ " $4}' || echo "❌ 异常"
           echo "└──────────────────────────────────────────┘"
 
-      - name: 🤖 执行自动化脚本（v7 完整浏览器录屏版）
+      - name: 🤖 执行自动化脚本（v7.7 带 GOST 代理与防阻塞续期版）
         run: |
           mkdir -p videos
           echo "🚀 脚本启动中..."
-          python3 acl_cloud_playwright_v7.py
+          python3 acl_cloud_renew_v7.7.py
           echo "🏁 脚本执行完毕"
         env:
           PYTHONUNBUFFERED: "1"
+          # 传入本地 GOST 的 SOCKS5 监听端口给 Python 脚本
+          SOCKS5_PROXY: "socks5://127.0.0.1:40000"
 
       - name: 🎬 上传屏幕录屏（完整浏览器 UI）
         if: always()
