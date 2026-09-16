@@ -124,7 +124,7 @@ jobs:
         run: |
           mkdir -p videos
           echo "🚀 脚本启动中..."
-          python3 acl_cloud_renew_v7.7.py
+          python3 acl_cloud_playwright_v7.7.py
           echo "🏁 脚本执行完毕"
         env:
           PYTHONUNBUFFERED: "1"
