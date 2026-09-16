@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.4）
-更新：
-  1. 语言切换改为弹窗式识别 + OCR 兜底
-  2. 服务器信息获取对齐原始 Selenium v6.1 逻辑
-  3. 电源管理：通过 Uptime 判断在线（有运行时间=Online），Online 不重启，Offline 执行 Start
-  4. 企业微信通知改为纯文本格式，去掉 <b> 标签，美化排版
-  5. 【v7.4 修复】验证码/国旗图片下载：
-     - 相对路径改用 urllib.parse.urljoin(page.url, src) 拼接，
-       修复续期弹窗场景下 base_url 错误导致 URL 出现 /dashboard/dashboard 重复、
-       下载到 404 HTML 页面、PIL 报 "cannot identify image file" 的问题
-     - 改用 page.context.request.get() 下载，共享浏览器 Cookie/Session
-     - 支持 data:image Base64 内联图片直接解码
-     - 打印完整 URL 与 HTTP 状态码，便于排查
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.5）
+更新（v7.5）：
+  1. 【修复】登录成功后未滚动页面导致首页下方 Renew 区域懒加载未渲染、识别不到的问题
+     - 新增 scroll_page_to_bottom()，缓慢滚动触发懒加载
+     - Renew 检测/点击不再依赖 CSS Module 类名（HomePage-module_xxx 每次构建都会变），
+       改为按钮文字定位：button:has-text('Renew') / 'Renouveler'
+  2. 【修复】语言切换误判：badge 文本可能是 'ENGLISH'，改为包含判断
+  3. 【优化】服务器信息获取改为类名无关的文本定位 XPath，
+     兼容 CSS Module 类名（Time remaining / Plan / Uptime / Status）
+  4. 【优化】电源管理 Uptime 检测改为文本定位；Start 按钮同样改为文字定位
+  5. 【优化】新增 ACL_SERVER_ID（默认 3727），Manage 按钮找不到时直接访问
+     /server/<id> 详情页，不再依赖导航是否成功
+其余同 v7.4：验证码/国旗图片下载统一走 download_image_bytes（urljoin + Cookie + data URI）
 """
 
 import os
@@ -36,6 +36,7 @@ USERNAME = os.getenv("ACL_USERNAME", "")
 PASSWORD = os.getenv("ACL_PASSWORD", "")
 LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
 WECHAT_WEBHOOK_KEY = os.getenv("WECHAT_WEBHOOK_KEY", "")
+SERVER_ID = os.getenv("ACL_SERVER_ID", "3727")   # 服务器 ID，Manage 按钮找不到时直接访问详情页
 MAX_RETRIES = 3
 VIDEO_DIR = "videos"
 RECORDING_FILE = "full_operation_recording.mp4"
@@ -184,6 +185,26 @@ def diagnostic_screenshot(page, name):
         print(f"⚠️ 截图失败: {e}")
 
 
+def scroll_page_to_bottom(page, step=600, pause=0.6, max_steps=20):
+    """v7.5 新增：缓慢滚动到页面底部，触发懒加载，确保首页下方 Renew 区域渲染出来"""
+    print("  📜 滚动页面加载全部内容...")
+    try:
+        for i in range(max_steps):
+            page.mouse.wheel(0, step)
+            time.sleep(pause)
+            try:
+                height = page.evaluate("document.body ? document.body.scrollHeight : 0")
+                cur = page.evaluate("window.scrollY + window.innerHeight")
+                if height and cur >= height - 10:
+                    print(f"  ✅ 已滚动到底部 (step {i + 1})")
+                    break
+            except Exception:
+                break
+    except Exception as e:
+        print(f"  ⚠️ 滚动异常（忽略）: {e}")
+    time.sleep(1)
+
+
 def wait_and_type(page, selectors, value, label="输入框", delay_ms=50):
     print(f"  🔍 查找 {label}...")
     for sel in selectors:
@@ -251,7 +272,7 @@ def safe_find_text(page, selectors, default=""):
             loc = page.locator(sel).first
             if loc.is_visible(timeout=1000):
                 return loc.inner_text().strip()
-        except:
+        except Exception:
             continue
     return default
 
@@ -273,7 +294,7 @@ def close_install_popup(page):
                         print("✅ 已关闭安装弹窗")
                         time.sleep(0.5)
                         return True
-            except:
+            except Exception:
                 continue
     except Exception as e:
         print(f"ℹ️ 无需关闭弹窗: {e}")
@@ -298,14 +319,14 @@ def wait_for_login_page(page, url):
                     page.wait_for_selector(sel, state="visible", timeout=5000)
                     print(f"  ✅ 登录表单已就绪: '{sel}'")
                     return True
-                except:
+                except Exception:
                     continue
-            print(f"  ⚠️ 第 {attempt+1} 次：表单未就绪，重试...")
-            diagnostic_screenshot(page, f"login_retry_{attempt+1}")
+            print(f"  ⚠️ 第 {attempt + 1} 次：表单未就绪，重试...")
+            diagnostic_screenshot(page, f"login_retry_{attempt + 1}")
             time.sleep(3)
         except Exception as e:
-            print(f"  ❌ 第 {attempt+1} 次加载失败: {e}")
-            diagnostic_screenshot(page, f"load_error_{attempt+1}")
+            print(f"  ❌ 第 {attempt + 1} 次加载失败: {e}")
+            diagnostic_screenshot(page, f"load_error_{attempt + 1}")
             time.sleep(3)
     return False
 
@@ -392,7 +413,7 @@ def process_captcha(page, flow_name=""):
             if "Verified" in vtext or "Vérifié" in vtext:
                 print(f"  ✅ 验证通过 (Verified: {vtext})")
                 return True
-    except:
+    except Exception:
         pass
 
     try:
@@ -404,7 +425,7 @@ def process_captcha(page, flow_name=""):
                     if el.is_visible() and el.inner_text().strip():
                         print(f"  ❌ 验证失败（错误: {el.inner_text().strip()[:50]}）")
                         return False
-            except:
+            except Exception:
                 continue
 
         captcha_selectors = ["div.auth-captcha-options", ".captcha-options", "div.auth-captcha-prompt", ".auth-captcha-checkbox"]
@@ -415,7 +436,7 @@ def process_captcha(page, flow_name=""):
                 for el in els:
                     if el.is_visible():
                         visible_captcha += 1
-            except:
+            except Exception:
                 continue
         if visible_captcha == 0:
             print("  ✅ 验证通过（弹窗关闭）")
@@ -432,7 +453,7 @@ def process_captcha(page, flow_name=""):
                         if txt:
                             print(f"  ✅ 验证通过 (成功提示: {txt[:30]})")
                             return True
-            except:
+            except Exception:
                 continue
     except Exception as e:
         print(f"  ⚠️ 验证检测异常: {e}")
@@ -465,9 +486,9 @@ def check_login_success(page, timeout=20):
                     if loc.is_visible(timeout=500):
                         print(f"  🎉 登录成功（内容: '{sel}'）URL: {current_url}")
                         return True
-                except:
+                except Exception:
                     continue
-        except:
+        except Exception:
             pass
 
         try:
@@ -476,7 +497,7 @@ def check_login_success(page, timeout=20):
             form_gone = False
             try:
                 form_gone = not email_input.is_visible(timeout=500) or not pwd_input.is_visible(timeout=500)
-            except:
+            except Exception:
                 form_gone = True
 
             if form_gone:
@@ -487,7 +508,7 @@ def check_login_success(page, timeout=20):
                 if any(kw in body_text for kw in dashboard_keywords):
                     print(f"  🎉 登录成功（表单消失 + Dashboard 内容）")
                     return True
-        except:
+        except Exception:
             pass
 
         if current_url != last_url:
@@ -504,7 +525,7 @@ def check_login_success(page, timeout=20):
         if any(kw in body_text for kw in ["Bienvenue", "Dashboard", "Tableau de bord", "Mes services", "My services"]):
             print(f"  🎉 登录成功（最终内容确认）")
             return True
-    except:
+    except Exception:
         pass
 
     print(f"  ⚠️ 登录检测超时，最终 URL: {final_url}")
@@ -535,7 +556,7 @@ def switch_language_to_en(page):
             if loc.is_visible():
                 lang_button = loc
                 break
-        except:
+        except Exception:
             continue
 
     if not lang_button:
@@ -546,7 +567,7 @@ def switch_language_to_en(page):
     try:
         badge = lang_button.locator(".lang-code-badge").first
         current_lang = badge.inner_text().strip().upper()
-    except:
+    except Exception:
         try:
             flag_img = lang_button.locator("img").first
             alt_text = flag_img.get_attribute("alt") or ""
@@ -554,10 +575,11 @@ def switch_language_to_en(page):
                 current_lang = "EN"
             elif "francais" in alt_text.lower() or "français" in alt_text.lower():
                 current_lang = "FR"
-        except:
+        except Exception:
             pass
 
-    if current_lang == "EN":
+    # v7.5 修复：badge 文本可能是 "EN" / "ENGLISH"，统一做包含判断
+    if "EN" in current_lang:
         print("✅ 当前语言已是 English，无需切换")
         return True
 
@@ -600,7 +622,7 @@ def switch_language_to_en(page):
                     en_option = loc
                     print(f"✅ 直接定位到 English 选项: '{sel}'")
                     break
-        except:
+        except Exception:
             continue
 
     if not en_option:
@@ -625,7 +647,7 @@ def switch_language_to_en(page):
                     modal = loc
                     print(f"✅ 找到弹窗容器: '{sel}'")
                     break
-            except:
+            except Exception:
                 continue
 
         if modal:
@@ -694,9 +716,9 @@ def switch_language_to_en(page):
                         en_option = btn
                         print("✅ 全局搜索找到 English 选项")
                         break
-                except:
+                except Exception:
                     continue
-        except:
+        except Exception:
             pass
 
     if not en_option:
@@ -716,16 +738,16 @@ def switch_language_to_en(page):
                 time.sleep(0.5)
             else:
                 break
-    except:
+    except Exception:
         pass
 
     try:
         badge = page.locator("button[class*='LanguageButton'] .lang-code-badge").first
         if badge.is_visible(timeout=3000):
-            if badge.inner_text().strip().upper() == "EN":
+            if "EN" in badge.inner_text().strip().upper():
                 print("✅ 语言切换验证通过：EN")
                 return True
-    except:
+    except Exception:
         pass
 
     try:
@@ -733,7 +755,7 @@ def switch_language_to_en(page):
         if "My services" in body_text or "Dashboard" in body_text:
             print("✅ 语言切换验证通过（页面内容已英文）")
             return True
-    except:
+    except Exception:
         pass
 
     print("⚠️ 无法验证语言切换结果，继续执行")
@@ -753,99 +775,82 @@ def needs_renewal(status_text):
 
 
 def perform_renewal(page):
+    """
+    v7.5 重写：
+      - 先 scroll_page_to_bottom() 触发懒加载，让首页下方续期区域渲染出来
+      - Renew 按钮不再依赖 CSS Module 类名，按文字定位（Renew / Renouveler）
+      - 向上回溯行容器读取状态文本，仅当状态提示需要续期时才点击
+    """
     global NEED_RENEWAL, RENEWAL_SUCCESS
     print("\n🔄 开始执行续期操作...")
     close_install_popup(page)
 
-    try:
-        table = page.locator("div.home-renewal-table, .renewal-table, [class*='renewal']").first
-        table.wait_for(state="visible", timeout=15000)
-        print("✅ 续期表格已加载")
-        table.scroll_into_view_if_needed()
-        time.sleep(1)
+    scroll_page_to_bottom(page)
 
-        row_selectors = [
-            "div.home-renewal-row", ".renewal-row",
-            "tr[class*='renewal']", "div[class*='renewal-row']",
-            ".home-renewal-table > div > div"
-        ]
-
-        renewal_rows = []
-        for sel in row_selectors:
-            rows = page.locator(sel).all()
-            if len(rows) > 0:
-                renewal_rows = rows
-                print(f"📋 使用选择器 '{sel}' 找到 {len(rows)} 个续期项目")
+    renew_buttons = []
+    for sel in [
+        "button:has-text('Renew')",
+        "button:has-text('Renouveler')",
+        "//button[span[normalize-space()='Renew']]",
+        "//button[normalize-space()='Renew']",
+    ]:
+        try:
+            loc = page.locator(f"xpath={sel}").first if sel.startswith("//") else page.locator(sel)
+            btns = [b for b in loc.all() if b.is_visible()]
+            if btns:
+                renew_buttons = btns
+                print(f"📋 找到 {len(btns)} 个 Renew 按钮 (selector: {sel})")
                 break
+        except Exception:
+            continue
 
-        if not renewal_rows:
-            print("⚠️ 未找到续期项目")
-            return True
-
-        for idx, row in enumerate(renewal_rows):
-            try:
-                status = safe_find_text(row, ["span.home-renewal-status", ".renewal-status", "td:nth-child(4)", ".status"])
-                model_name = safe_find_text(row, ["strong.home-renewal-name", ".renewal-name", "td:nth-child(2)", ".model"])
-                renewal_date = safe_find_text(row, ["strong.home-renewal-date-main", ".renewal-date", "td:nth-child(3)", ".date"])
-
-                print(f"\n📦 项目 {idx + 1}: {model_name or '未知'}")
-                print(f"  📅 续期日期: {renewal_date or '未知'}")
-                print(f"  📊 状态: {status or '未知'}")
-
-                if not status:
-                    continue
-
-                if needs_renewal(status):
-                    NEED_RENEWAL = True
-                    print(f"  ⚠️ 需要续期！")
-                    row.scroll_into_view_if_needed()
-                    time.sleep(0.5)
-
-                    renew_sels = [
-                        "button.home-renew-action", ".renew-action",
-                        "button[class*='renew']", "td:last-child button", ".actions button"
-                    ]
-                    renew_button = None
-                    for rsel in renew_sels:
-                        try:
-                            rb = row.locator(rsel).first
-                            if rb and rb.is_visible():
-                                renew_button = rb
-                                print(f"  ✅ 找到 Renew 按钮 ({rsel})")
-                                break
-                        except:
-                            continue
-
-                    if not renew_button:
-                        print(f"  ❌ 未找到 Renew 按钮")
-                        continue
-
-                    renew_button.click()
-                    print(f"  ✅ 已点击 Renew 按钮")
-                    time.sleep(2)
-
-                    if process_captcha(page, flow_name="renewal_popup"):
-                        RENEWAL_SUCCESS = True
-                        print("✅ 续期验证通过！")
-                    else:
-                        print("❌ 续期验证失败")
-                    time.sleep(2)
-                    close_install_popup(page)
-                else:
-                    print(f"  ✅ 状态正常，无需续期")
-
-            except Exception as e:
-                print(f"  ❌ 处理项目 {idx + 1} 出错: {e}")
-                continue
-
+    if not renew_buttons:
+        print("ℹ️ 页面上没有可见的 Renew 按钮，无需续期")
         return True
 
-    except PlaywrightTimeout:
-        print("❌ 续期表格加载超时")
-        return False
-    except Exception as e:
-        print(f"❌ 续期操作失败: {e}")
-        return False
+    for idx, btn in enumerate(renew_buttons):
+        try:
+            # 向上找最近的行/卡片容器，读取该行文本（状态/日期/名称）
+            row_text = ""
+            try:
+                row = btn.locator(
+                    "xpath=ancestor::*[self::tr or contains(@class,'row') or contains(@class,'item') "
+                    "or contains(@class,'card') or contains(@class,'renewal')][1]"
+                ).first
+                if row.is_visible(timeout=1000):
+                    row_text = row.inner_text().strip()
+            except Exception:
+                row_text = ""
+
+            short = row_text[:120].replace("\n", " | ") if row_text else "(无法读取行信息)"
+            print(f"\n📦 项目 {idx + 1}: {short}")
+
+            # 有状态文本且明确"正常"则跳过；否则 Renew 按钮出现即视为需要续期
+            if row_text and not needs_renewal(row_text):
+                lower = row_text.lower()
+                if any(kw in lower for kw in ["online", "active", "en ligne", "actif", "running"]):
+                    print(f"  ✅ 状态正常，无需续期")
+                    continue
+
+            NEED_RENEWAL = True
+            btn.scroll_into_view_if_needed()
+            time.sleep(0.5)
+            btn.click()
+            print(f"  ✅ 已点击 Renew 按钮")
+            time.sleep(2)
+
+            if process_captcha(page, flow_name="renewal_popup"):
+                RENEWAL_SUCCESS = True
+                print("✅ 续期验证通过！")
+            else:
+                print("❌ 续期验证失败")
+            time.sleep(2)
+            close_install_popup(page)
+        except Exception as e:
+            print(f"  ❌ 处理 Renew 按钮 {idx + 1} 出错: {e}")
+            continue
+
+    return True
 
 
 def navigate_to_services(page):
@@ -871,7 +876,7 @@ def navigate_to_services(page):
             if loc.is_visible():
                 nav_link = loc
                 break
-        except:
+        except Exception:
             continue
 
     if not nav_link:
@@ -896,7 +901,8 @@ def click_manage_button(page):
         "//a[contains(text(), 'Gerer')]",
         ".client-btn--primary",
         "a:has-text('Manage')",
-        "a:has-text('Gerer')"
+        "a:has-text('Gerer')",
+        "//a[contains(@href, '/server/')]",
     ]
 
     manage_btn = None
@@ -910,12 +916,21 @@ def click_manage_button(page):
             if loc.is_visible():
                 manage_btn = loc
                 break
-        except:
+        except Exception:
             continue
 
     if not manage_btn:
-        print("❌ 未找到 Manage 按钮")
-        return False
+        # v7.5：Manage 按钮找不到时，直接用配置的服务器 ID 访问详情页
+        fallback_url = f"https://aclclouds.com/server/{SERVER_ID}"
+        print(f"⚠️ 未找到 Manage 按钮，直接访问服务器详情页: {fallback_url}")
+        try:
+            page.goto(fallback_url, wait_until="networkidle", timeout=45000)
+            time.sleep(3)
+            print("✅ 已进入服务器详情页（直接 URL）")
+            return True
+        except Exception as e:
+            print(f"❌ 直接访问详情页失败: {e}")
+            return False
 
     manage_btn.scroll_into_view_if_needed()
     time.sleep(0.5)
@@ -923,6 +938,28 @@ def click_manage_button(page):
     time.sleep(3)
     print("✅ 已进入服务器详情页")
     return True
+
+
+def find_label_value(page, labels):
+    """
+    v7.5 新增：类名无关的文本定位。
+    在页面中查找包含指定 label 文本的元素，返回其相邻的值文本。
+    """
+    for label in labels:
+        xpaths = [
+            f"//*[contains(normalize-space(text()), '{label}')]/following-sibling::*[1]",
+            f"//*[contains(normalize-space(text()), '{label}')]/parent::*//following-sibling::*[1]",
+        ]
+        for xp in xpaths:
+            try:
+                loc = page.locator(f"xpath={xp}").first
+                if loc.is_visible(timeout=800):
+                    value = loc.inner_text().strip()
+                    if value and label.lower() not in value.lower():
+                        return value
+            except Exception:
+                continue
+    return ""
 
 
 def get_server_info(page):
@@ -938,30 +975,41 @@ def get_server_info(page):
         "uptime": "",
     }
 
+    # 1) 服务器名称
     try:
         info["server_name"] = page.locator("h1, .server-name, [class*='server-title']").first.inner_text(timeout=3000).strip()
-    except:
+    except Exception:
         info["server_name"] = "ACL Cloud Server"
 
+    # 2) Uptime / Status：优先类名选择器（旧版页面），失败后走文本定位（v7.5）
+    uptime_value = ""
     try:
         stat_items = page.locator("div.stat-item").all()
         for item in stat_items:
             try:
                 label = item.locator(".stat-label").first.inner_text(timeout=1000).strip()
                 if "Status" in label or "Uptime" in label or "status" in label.lower():
-                    value = item.locator(".stat-value").first.inner_text(timeout=1000).strip()
-                    info["uptime"] = value
-                    SERVER_UPTIME = value
-                    print(f"  ⏱️ Status/Uptime: {value}")
-                    if value and any(c in value for c in ["h", "m", "s", "d"]):
-                        info["status"] = SERVER_STATUS = "online"
-                        print(f"  🟢 检测到运行时间，判断为 Online")
+                    uptime_value = item.locator(".stat-value").first.inner_text(timeout=1000).strip()
                     break
-            except:
+            except Exception:
                 continue
-    except Exception as e:
-        print(f"  ⚠️ 获取 Uptime 失败: {e}")
+    except Exception:
+        pass
 
+    if not uptime_value:
+        uptime_value = find_label_value(page, ["Uptime", "Temps de fonctionnement", "Running for"])
+
+    if uptime_value:
+        info["uptime"] = uptime_value
+        SERVER_UPTIME = uptime_value
+        print(f"  ⏱️ Uptime: {uptime_value}")
+        if any(c in uptime_value for c in ["h", "m", "s", "d", "jour", "heure", "min"]):
+            info["status"] = SERVER_STATUS = "online"
+            print(f"  🟢 检测到运行时间，判断为 Online")
+    else:
+        print("  ⚠️ 未获取到 Uptime")
+
+    # 3) Status badge（文本/属性兜底）
     if info["status"] == "unknown":
         try:
             badge = page.locator("span.status-badge[data-status], .status-badge, [class*='status-badge']").first
@@ -975,30 +1023,25 @@ def get_server_info(page):
                 elif any(w in raw for w in ["offline", "hors ligne", "inactif", "stopped"]):
                     info["status"] = SERVER_STATUS = "offline"
                     print(f"  🔴 Offline (badge: {txt})")
-        except:
+        except Exception:
             pass
 
+    # 4) Time remaining / Plan / Renewal note：先容器类名，后文本定位（v7.5）
     try:
-        info_container = None
         info_selectors = [
             "div[style*='background: rgba(49, 95, 79']",
-            "div[style*='background: rgba(49, 95, 79, 0.06)']",
             ".server-info-card",
             "[class*='server-info']",
-            "//div[contains(text(), 'Time remaining')]",
-            "//div[contains(text(), 'Temps restant')]",
         ]
+        info_container = None
         for sel in info_selectors:
             try:
-                if sel.startswith("//"):
-                    loc = page.locator(f"xpath={sel}").first
-                else:
-                    loc = page.locator(sel).first
+                loc = page.locator(sel).first
                 if loc.is_visible(timeout=2000):
                     info_container = loc
                     print(f"  ✅ 找到信息容器: '{sel}'")
                     break
-            except:
+            except Exception:
                 continue
 
         if info_container:
@@ -1006,19 +1049,25 @@ def get_server_info(page):
             lines = [line.strip() for line in text.split('\n') if line.strip()]
             for line in lines:
                 if "Time remaining" in line or "Temps restant" in line:
-                    info["time_remaining"] = line.split(":", 1)[-1].strip()
+                    info["time_remaining"] = line.split(":", 1)[-1].strip() if ":" in line else line
                 elif any(w in line.lower() for w in ["plan", "gratuit", "free"]):
                     info["plan"] = line
                 elif any(w in line.lower() for w in ["renewal", "renouvellement", "renew"]):
                     info["renewal_note"] = line
-
-            print(f"  ⏰ Time remaining: {info['time_remaining'] or '未获取'}")
-            print(f"  📋 Plan: {info['plan'] or '未获取'}")
-            print(f"  📝 Renewal: {info['renewal_note'] or '未获取'}")
-        else:
-            print("  ⚠️ 未找到信息容器（Time remaining 等）")
     except Exception as e:
-        print(f"  ❌ 获取 Time remaining 信息失败: {e}")
+        print(f"  ⚠️ 容器解析失败: {e}")
+
+    # 文本定位兜底
+    if not info["time_remaining"]:
+        info["time_remaining"] = find_label_value(page, ["Time remaining", "Temps restant"])
+    if not info["plan"]:
+        plan_text = find_label_value(page, ["Plan", "Forfait"])
+        if plan_text:
+            info["plan"] = plan_text
+
+    print(f"  ⏰ Time remaining: {info['time_remaining'] or '未获取'}")
+    print(f"  📋 Plan: {info['plan'] or '未获取'}")
+    print(f"  📝 Renewal: {info['renewal_note'] or '未获取'}")
 
     diagnostic_screenshot(page, "server_info")
     return info
@@ -1031,27 +1080,17 @@ def manage_server_power(page):
     has_uptime = False
     uptime_value = SERVER_UPTIME
 
-    if uptime_value and any(c in uptime_value for c in ["h", "m", "s", "d"]):
+    if uptime_value and any(c in uptime_value for c in ["h", "m", "s", "d", "jour", "heure", "min"]):
         has_uptime = True
         print(f"  📊 使用已获取的运行时间: {uptime_value} → Online")
     else:
-        try:
-            stat_items = page.locator("div.stat-item").all()
-            for item in stat_items:
-                try:
-                    label = item.locator(".stat-label").first.inner_text(timeout=1000).strip()
-                    if "Status" in label or "Uptime" in label:
-                        value = item.locator(".stat-value").first.inner_text(timeout=1000).strip()
-                        if value and any(c in value for c in ["h", "m", "s", "d"]):
-                            has_uptime = True
-                            uptime_value = value
-                            SERVER_UPTIME = value
-                            print(f"  📊 检测到运行时间: {value} → Online")
-                        break
-                except:
-                    continue
-        except Exception as e:
-            print(f"  ⚠️ stat-item 检测失败: {e}")
+        # 文本定位重新检测（v7.5）
+        uptime_value = find_label_value(page, ["Uptime", "Temps de fonctionnement", "Running for"])
+        if uptime_value:
+            SERVER_UPTIME = uptime_value
+            if any(c in uptime_value for c in ["h", "m", "s", "d", "jour", "heure", "min"]):
+                has_uptime = True
+                print(f"  📊 检测到运行时间: {uptime_value} → Online")
 
     if not has_uptime:
         print("🔴 未检测到运行时间，服务器可能 Offline，执行 Start...")
@@ -1060,6 +1099,11 @@ def manage_server_power(page):
             "button[data-variant='start']",
             "//button[contains(@class, 'power-btn') and contains(., 'Start')]",
             "//button[contains(@class, 'power-btn') and contains(., 'Demarrer')]",
+            # v7.5 兜底：文字定位，不再依赖类名
+            "button:has-text('Start')",
+            "button:has-text('Démarrer')",
+            "button:has-text('Demarrer')",
+            "//button[contains(translate(., 'START', 'start'), 'start')]",
         ], label="Start 按钮"):
             POWER_ACTION = "start"
             print("✅ Start 已点击")
@@ -1086,7 +1130,7 @@ def send_wechat_notification(info, need_renewal, renewal_success, power_action):
     status = info.get("status", "unknown")
     uptime = info.get("uptime", SERVER_UPTIME or "未知")
 
-    if uptime and uptime != "未知" and any(c in uptime for c in ["h", "m", "s", "d"]):
+    if uptime and uptime != "未知" and any(c in uptime for c in ["h", "m", "s", "d", "jour", "heure", "min"]):
         status = "online"
 
     if need_renewal and renewal_success:
@@ -1230,7 +1274,7 @@ def main():
 
             login_ok = False
             for attempt in range(MAX_RETRIES):
-                print(f"\n🔄 验证码尝试 {attempt+1}/{MAX_RETRIES}")
+                print(f"\n🔄 验证码尝试 {attempt + 1}/{MAX_RETRIES}")
                 if process_captcha(page, flow_name="login"):
                     if wait_and_click(page, [
                         "button:has-text('Sign in')",
@@ -1269,19 +1313,22 @@ def main():
 
             close_install_popup(page)
 
+            # v7.5：先滚动到底部触发懒加载，再按按钮文字检测 Renew
             print("\n🔍 检查是否需要续期...")
             has_renewal = False
             try:
-                renewal_table = page.locator("div.home-renewal-table, .renewal-table, [class*='renewal']").first
-                renew_buttons = page.locator("button.home-renew-action, .renew-action, button[class*='renew']").all()
-                visible_renew = [b for b in renew_buttons if b.is_visible()]
-                if renewal_table.is_visible() and len(visible_renew) > 0:
+                scroll_page_to_bottom(page)
+                renew_btns = page.locator(
+                    "button:has-text('Renew'), button:has-text('Renouveler')"
+                ).all()
+                visible_renew = [b for b in renew_btns if b.is_visible()]
+                if len(visible_renew) > 0:
                     has_renewal = True
-                    print("✅ 检测到需要续期的项目")
+                    print(f"✅ 检测到 {len(visible_renew)} 个需要续期的项目")
                 else:
                     print("ℹ️ 未检测到需要续期的项目")
-            except Exception:
-                print("ℹ️ 仪表盘上没有续期表格")
+            except Exception as e:
+                print(f"ℹ️ 续期检测异常: {e}")
 
             if has_renewal:
                 print("\n📌 执行续期流程...")
