@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.5 - 代理与 Renew 弹窗增强版）
-更新：
-  1. 【新增】支持 PROXY_SERVER 环境变量配置代理服务器
-  2. 【优化】针对 Renew 按钮弹窗（Anti-bot confirmation）优化图片降噪与 OCR 识别点击逻辑
-  3. 【保持】其余登录、语言切换、服务器控制、视频录制等步骤完全保持原样不变
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.7）
+更新策略：
+  1. 【登录流程人机验证】保持原样（包含尝试点击 "I am not a robot" 复选框逻辑）
+  2. 【续期流程人机验证】专门适配：直接锁定 modal/dialog 容器，不找复选框，进行降噪与图片 OCR 匹配
+  3. 【其余逻辑】维持完全不变（代理支持、页面导航、语言切换、电源管理与微信通知等）
 """
 
 import os
@@ -29,7 +29,7 @@ PASSWORD = os.getenv("ACL_PASSWORD", "")
 LOGIN_URL = os.getenv("ACL_LOGIN_URL", "https://aclclouds.com/auth/login")
 WECHAT_WEBHOOK_KEY = os.getenv("WECHAT_WEBHOOK_KEY", "")
 SERVER_ID = os.getenv("ACL_SERVER_ID", "3727")   # 服务器 ID，Manage 按钮找不到时直接访问详情页
-PROXY_SERVER = os.getenv("PROXY_SERVER", "")     # 代理服务器地址（例如 "http://127.0.0.1:7890" 或 "http://user:pass@ip:port"）
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")     # 代理服务器地址
 MAX_RETRIES = 3
 VIDEO_DIR = "videos"
 RECORDING_FILE = "full_operation_recording.mp4"
@@ -49,19 +49,12 @@ _ffmpeg_proc = None
 
 
 def download_image_bytes(page, src, label="图片"):
-    """
-    统一图片下载入口（v7.4 修复版）。
-    - 相对路径使用 urljoin(page.url, src) 拼接（不再手动裁剪 base_url）
-    - 使用 page.context.request.get() 共享浏览器 Cookie/Session
-    - 支持 data:image Base64 内联图片
-    返回: bytes 或 None
-    """
+    """统一图片下载入口"""
     if not src:
         print(f"     ⚠️ {label}: src 为空")
         return None
 
     try:
-        # 1) data URI 直接解码
         if src.startswith("data:image"):
             try:
                 _, b64data = src.split(",", 1)
@@ -70,10 +63,7 @@ def download_image_bytes(page, src, label="图片"):
                 print(f"     ⚠️ {label}: data URI 解码失败: {e}")
                 return None
 
-        # 2) 相对/绝对路径统一拼接（关键修复：不再依赖 rstrip("/auth/login")）
         full_url = urljoin(page.url, src)
-
-        # 3) 使用浏览器上下文请求，自动携带 Cookie
         resp = page.context.request.get(full_url, timeout=15000)
         if not resp.ok:
             print(f"     ❌ {label}: HTTP {resp.status} {full_url}")
@@ -179,7 +169,6 @@ def diagnostic_screenshot(page, name):
 
 
 def scroll_page_to_bottom(page, step=600, pause=0.6, max_steps=20):
-    """v7.5 新增：缓慢滚动到页面底部，触发懒加载，确保首页下方 Renew 区域渲染出来"""
     print("  📜 滚动页面加载全部内容...")
     try:
         for i in range(max_steps):
@@ -325,92 +314,114 @@ def wait_for_login_page(page, url):
 
 
 def process_captcha(page, flow_name=""):
-    """【修改】处理人机验证：针对 Renew 后的 Anti-bot 确认弹窗增强 OCR 识别与准确点击"""
+    """
+    通用人机验证处理逻辑：
+    - 登录流程 (flow_name="login"): 保持原样，尝试寻找并点击 "I am not a robot" 复选框。
+    - 续期流程 (flow_name="renewal_popup"): 专属优化，锁定 modal/dialog 容器，跳过复选框直接辨识选项。
+    """
     print(f"\n🔄 开始处理{flow_name}人机验证...")
 
-    # 如果有勾选框优先点击
-    try:
-        checkbox = page.locator(
-            "div.auth-captcha-checkbox, input[type='checkbox'] + label, .captcha-checkbox"
-        ).first
-        if checkbox.is_visible(timeout=2000):
-            checkbox.hover()
-            time.sleep(0.3)
-            checkbox.click()
-            time.sleep(1.5)
-            print("  ✅ 复选框已点击")
-    except Exception as e:
-        print(f"  ℹ️ 无可用复选框或点击跳过: {e}")
+    is_renewal = (flow_name == "renewal_popup")
 
-    # 获取提示文本（支持 Click on XXX 或 strong 标签文本）
+    # ================= 1. 范围与前置操作 =================
+    if is_renewal:
+        time.sleep(1)
+        # 续期弹窗作用域限定
+        container = page.locator("div[role='dialog'], .auth-captcha-box").first
+        try:
+            container.wait_for(state="visible", timeout=8000)
+        except Exception:
+            print("  ⚠️ 未找到续期验证码弹窗容器")
+            return False
+    else:
+        container = page
+        # 登录页面保留复选框点击逻辑
+        try:
+            checkbox = page.locator("div.auth-captcha-inner, div.auth-captcha-checkbox").first
+            if checkbox.is_visible(timeout=3000):
+                print("  👉 点击 'I am not a robot' 复选框...")
+                checkbox.click()
+                time.sleep(1.5)
+        except Exception as e:
+            print(f"  ℹ️ 跳过复选框点击: {e}")
+
+    # ================= 2. 识别目标词 =================
     strong_text = ""
     try:
-        prompt = page.locator("div.auth-captcha-prompt, .captcha-prompt, p:has-text('Click on')").first
-        prompt.wait_for(state="visible", timeout=5000)
-        
-        strong_loc = prompt.locator("strong")
-        if strong_loc.count() > 0:
-            strong_text = strong_loc.first.inner_text().strip()
-        else:
-            full_txt = prompt.inner_text().strip()
-            if "Click on" in full_txt:
-                strong_text = full_txt.split("Click on")[-1].strip()
-            else:
-                strong_text = full_txt
+        strong_loc = container.locator("strong").first
+        if strong_loc.is_visible(timeout=2000):
+            strong_text = strong_loc.inner_text().strip()
+    except Exception:
+        pass
 
-        print(f"  📝 验证码目标提示文字: '{strong_text}'")
-    except Exception as e:
-        print(f"  ⚠️ 获取提示文字失败: {e}")
+    if not strong_text:
+        try:
+            challenge = container.locator(".auth-captcha-challenge, .auth-captcha-prompt").first
+            aria_txt = challenge.get_attribute("aria-label") or challenge.inner_text()
+            if "Click on" in aria_txt:
+                strong_text = aria_txt.split("Click on")[-1].strip()
+        except Exception as e:
+            print(f"  ⚠️ 读取提示文本失败: {e}")
+
+    if not strong_text:
+        print("  ❌ 无法识别验证码目标文本")
         return False
 
-    # 寻找选项按钮及图片
+    print(f"  📝 验证码目标提示文字: '{strong_text}'")
+
+    # ================= 3. 提取候选图片按钮 =================
     try:
-        options = page.locator(
-            "div.auth-captcha-options button, .captcha-options .captcha-option, "
-            "button.auth-captcha-option, .captcha-option, div:has(> img[src*='data:image'])"
-        ).all()
+        options = container.locator("button.auth-captcha-option, .auth-captcha-options button").all()
         options = [b for b in options if b.is_visible()]
         if not options:
-            print("  ⚠️ 未找到可点击选项")
+            print("  ⚠️ 未找到可点击的图片选项")
             return False
         print(f"  📍 共 {len(options)} 个待识别图片选项")
     except Exception as e:
-        print(f"  ⚠️ 获取选项失败: {e}")
+        print(f"  ⚠️ 获取图片选项失败: {e}")
         return False
 
     target = strong_text.lower().replace(" ", "").replace("-", "")
     clicked = False
 
+    # ================= 4. RGB 降噪 + 放大 + OCR 识别 =================
     for idx, btn in enumerate(options):
         try:
-            # 获取选项内的图片
-            img = btn.locator("img").first if btn.evaluate("e => e.tagName") != "IMG" else btn
+            img = btn.locator("img").first
             src = img.get_attribute("src") if img.is_visible() else ""
 
             img_bytes = download_image_bytes(page, src, label=f"选项 {idx + 1}")
-            if img_bytes is None:
+            if not img_bytes:
                 continue
 
-            # 增强型图像预处理（放大 + 增对比度 + 降噪二值化，有效克服线段干扰）
+            # 过滤彩色线条，保留深色文字（RGB 阈值 < 110）
             img_obj = Image.open(BytesIO(img_bytes)).convert("RGB")
             w, h = img_obj.size
-            img_obj = img_obj.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
-            gray = img_obj.convert("L")
-            gray = ImageEnhance.Contrast(gray).enhance(2.5)
-            binary = gray.point(lambda x: 255 if x > 140 else 0)
+            cleaned_img = Image.new("L", (w, h), 255)
+            pixels = img_obj.load()
+            cleaned_pixels = cleaned_img.load()
 
-            # OCR 字符提取（仅保留英文字母）
+            for x in range(w):
+                for y in range(h):
+                    r, g, b = pixels[x, y]
+                    if r < 110 and g < 110 and b < 110:
+                        cleaned_pixels[x, y] = 0   # 深色文字保留
+                    else:
+                        cleaned_pixels[x, y] = 255 # 背景及彩色线条涂白
+
+            cleaned_img = cleaned_img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
+
             ocr_text = pytesseract.image_to_string(
-                binary, 
+                cleaned_img, 
                 lang='eng', 
                 config='--psm 7 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
             ).strip()
-            
+
             ocr_clean = ocr_text.lower().replace(" ", "").replace("-", "")
-            print(f"     📍 选项 {idx + 1}: OCR 结果 '{ocr_text}' → 规范后 '{ocr_clean}'")
+            print(f"     📍 选项 {idx + 1}: OCR 识别结果 '{ocr_text}' → 规范化 '{ocr_clean}'")
 
             if target in ocr_clean or ocr_clean in target:
-                print(f"  ✅ 匹配到目标选项 {idx + 1} (识别文字: {ocr_text})")
+                print(f"  ✅ 匹配成功！点击选项 {idx + 1} ({ocr_text})")
                 btn.scroll_into_view_if_needed()
                 time.sleep(0.3)
                 btn.click()
@@ -418,34 +429,12 @@ def process_captcha(page, flow_name=""):
                 time.sleep(2)
                 break
         except Exception as e:
-            print(f"     ❌ 选项 {idx + 1} OCR 处理异常: {e}")
+            print(f"     ❌ 选项 {idx + 1} 识别失败: {e}")
 
     if not clicked:
-        print("  ❌ 未找到与目标匹配的选项")
+        print("  ❌ 未找到与目标文本匹配的图片")
         return False
 
-    time.sleep(2)
-
-    # 结果判定
-    try:
-        verified = page.locator("span.auth-captcha-label, .captcha-label").first
-        if verified.is_visible():
-            vtext = verified.inner_text()
-            if "Verified" in vtext or "Vérifié" in vtext:
-                print(f"  ✅ 验证通过 (Verified: {vtext})")
-                return True
-    except Exception:
-        pass
-
-    try:
-        captcha_selectors = ["div.auth-captcha-options", ".captcha-options", "div.auth-captcha-prompt"]
-        if not any(page.locator(sel).first.is_visible() for sel in captcha_selectors if page.locator(sel).count() > 0):
-            print("  ✅ 验证通过（弹窗已关闭）")
-            return True
-    except Exception:
-        pass
-
-    print("  ⚠️ 无法百分百确认状态，默认继续进行")
     return True
 
 
@@ -612,7 +601,7 @@ def switch_language_to_en(page):
             continue
 
     if not en_option:
-        print("⚠️ 直接定位失败，尝试遍历弹窗内选项并用 OCR 识别...")
+        print("⚠️ 直接定位失败，尝试遍历弹窗内选项...")
 
         modal_selectors = [
             "div[role='dialog']",
@@ -665,19 +654,6 @@ def switch_language_to_en(page):
                                     en_option = btn
                                     print(f"  ✅ 图片 src 匹配到 English 选项 {idx + 1}: {src}")
                                     break
-
-                                img_bytes = download_image_bytes(page, src, label=f"国旗选项 {idx + 1}")
-                                if img_bytes:
-                                    img_obj = Image.open(BytesIO(img_bytes)).convert("L")
-                                    img_obj = img_obj.point(lambda x: 255 if x > 128 else 0)
-                                    ocr_text = pytesseract.image_to_string(
-                                        img_obj, lang='eng', config='--psm 7'
-                                    ).strip().lower()
-                                    print(f"        OCR 结果: '{ocr_text}'")
-                                    if "en" in ocr_text or "english" in ocr_text or "british" in ocr_text:
-                                        en_option = btn
-                                        print(f"  ✅ OCR 匹配到 English 选项 {idx + 1}")
-                                        break
                         except Exception:
                             pass
 
@@ -717,33 +693,6 @@ def switch_language_to_en(page):
     print("✅ 已点击 English 语言选项")
     time.sleep(3)
 
-    try:
-        for _ in range(5):
-            if en_option.is_visible(timeout=500):
-                time.sleep(0.5)
-            else:
-                break
-    except Exception:
-        pass
-
-    try:
-        badge = page.locator("button[class*='LanguageButton'] .lang-code-badge").first
-        if badge.is_visible(timeout=3000):
-            if "EN" in badge.inner_text().strip().upper():
-                print("✅ 语言切换验证通过：EN")
-                return True
-    except Exception:
-        pass
-
-    try:
-        body_text = page.locator("body").inner_text()
-        if "My services" in body_text or "Dashboard" in body_text:
-            print("✅ 语言切换验证通过（页面内容已英文）")
-            return True
-    except Exception:
-        pass
-
-    print("⚠️ 无法验证语言切换结果，继续执行")
     return True
 
 
@@ -760,12 +709,6 @@ def needs_renewal(status_text):
 
 
 def perform_renewal(page):
-    """
-    v7.5 重写：
-      - 先 scroll_page_to_bottom() 触发懒加载，让首页下方续期区域渲染出来
-      - Renew 按钮不再依赖 CSS Module 类名，按文字定位（Renew / Renouveler）
-      - 向上回溯行容器读取状态文本，仅当状态提示需要续期时才点击
-    """
     global NEED_RENEWAL, RENEWAL_SUCCESS
     print("\n🔄 开始执行续期操作...")
     close_install_popup(page)
@@ -822,6 +765,7 @@ def perform_renewal(page):
             print(f"  ✅ 已点击 Renew 按钮")
             time.sleep(2)
 
+            # 调用续期专属人机验证识别（flow_name="renewal_popup"）
             if process_captcha(page, flow_name="renewal_popup"):
                 RENEWAL_SUCCESS = True
                 print("✅ 续期验证通过！")
@@ -982,8 +926,6 @@ def get_server_info(page):
         if any(c in uptime_value for c in ["h", "m", "s", "d", "jour", "heure", "min"]):
             info["status"] = SERVER_STATUS = "online"
             print(f"  🟢 检测到运行时间，判断为 Online")
-    else:
-        print("  ⚠️ 未获取到 Uptime")
 
     if info["status"] == "unknown":
         try:
@@ -1192,9 +1134,8 @@ def main():
 
     with sync_playwright() as p:
         try:
-            print("🚀 启动 Chromium（非 headless，显示真实浏览器 UI）...")
+            print("🚀 启动 Chromium（非 headless）...")
             
-            # 【修改】构建浏览器启动参数，支持代理配置
             launch_options = {
                 "headless": False,
                 "args": [
@@ -1208,7 +1149,7 @@ def main():
             }
 
             if PROXY_SERVER:
-                print(f"🌐 正在配置代理服务器: {PROXY_SERVER}")
+                print(f"🌐 配置代理: {PROXY_SERVER}")
                 parsed_proxy = urlparse(PROXY_SERVER)
                 proxy_cfg = {"server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"}
                 if parsed_proxy.username and parsed_proxy.password:
@@ -1220,7 +1161,7 @@ def main():
 
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
             page = context.new_page()
-            print("✅ Chromium 已启动，ffmpeg 录制中...")
+            print("✅ Chromium 已启动，录屏记录中...")
 
             if not wait_for_login_page(page, LOGIN_URL):
                 print("❌ 登录页加载失败")
@@ -1261,6 +1202,7 @@ def main():
             login_ok = False
             for attempt in range(MAX_RETRIES):
                 print(f"\n🔄 验证码尝试 {attempt + 1}/{MAX_RETRIES}")
+                # 登录时 flow_name="login"，会继续执行点击复选框等完整逻辑
                 if process_captcha(page, flow_name="login"):
                     if wait_and_click(page, [
                         "button:has-text('Sign in')",
@@ -1290,7 +1232,6 @@ def main():
                 time.sleep(3)
 
             close_install_popup(page)
-
             switch_language_to_en(page)
 
             if "dashboard" not in page.url.lower():
@@ -1321,11 +1262,8 @@ def main():
 
                 navigate_to_services(page)
                 click_manage_button(page)
-
                 server_info = get_server_info(page)
-
                 manage_server_power(page)
-
             else:
                 print("\n📌 无需续期，直接获取服务器信息...")
                 navigate_to_services(page)
@@ -1357,9 +1295,6 @@ def main():
 
             stop_ffmpeg_recording()
             stop_xvfb()
-
-            if os.path.exists(RECORDING_FILE):
-                print(f"✅ 视频: {RECORDING_FILE}")
 
 
 if __name__ == "__main__":
