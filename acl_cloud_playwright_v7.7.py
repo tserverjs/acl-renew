@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ACL Cloud 自动续期脚本（Playwright 完整版 v7.8）
+ACL Cloud 自动续期脚本（Playwright 完整版 v7.9）
 优化：
-  1. 续期弹窗支持点击复选框并增加了必要的加载等待时间。
-  2. 延长 OCR 与选项提取前的显式等待，确保验证内容完整渲染。
+  1. 新增 Cap.js (cap-widget) PoW 人机验证处理：正确点击 Shadow DOM 内的
+     "Verify you're human" 复选框，并等待 PoW 求解完成、cap-token 注入表单。
+  2. 续期弹窗支持点击复选框并增加了必要的加载等待时间。
+  3. 延长 OCR 与选项提取前的显式等待，确保验证内容完整渲染。
+  4. 修复代理配置中 parsed_password 未定义的 bug。
 """
 
 import os
@@ -312,6 +315,120 @@ def wait_for_login_page(page, url):
     return False
 
 
+def solve_cap_widget(page, timeout_s=90):
+    """
+    处理 Cap.js (cap-widget) PoW 人机验证：
+      - 复选框位于 <cap-widget> 自定义元素的 Shadow DOM 内
+      - 点击后浏览器自动完成工作量证明，并向所在 <form> 注入隐藏的 cap-token
+    返回: True=验证通过, None=页面无 cap-widget, False=验证失败/超时
+    """
+    try:
+        widget = page.locator("cap-widget").first
+        widget.wait_for(state="attached", timeout=6000)
+    except Exception:
+        return None
+
+    print("  🤖 检测到 Cap.js (cap-widget) 人机验证")
+
+    # 等待 Shadow DOM 渲染完成
+    try:
+        page.wait_for_function(
+            "() => { const w = document.querySelector('cap-widget'); "
+            "return w && w.shadowRoot && w.shadowRoot.childElementCount > 0; }",
+            timeout=10000)
+    except Exception:
+        print("  ⚠️ cap-widget Shadow DOM 未就绪，仍尝试点击")
+
+    # 安装 solve / error 事件监听（每次调用重置标志位）
+    page.evaluate("""() => {
+        window.__capSolved = false;
+        window.__capError = false;
+        document.querySelectorAll('cap-widget').forEach(w => {
+            w.addEventListener('solve', () => { window.__capSolved = true; });
+            w.addEventListener('error', () => { window.__capError = true; });
+        });
+    }""")
+
+    def cap_token_ready():
+        try:
+            return page.evaluate("""() => {
+                if (window.__capSolved) return true;
+                const inp = document.querySelector('input[name="cap-token"]');
+                return !!(inp && inp.value && inp.value.length > 10);
+            }""")
+        except Exception:
+            return False
+
+    if cap_token_ready():
+        print("  ✅ Cap 验证已处于通过状态，无需重复点击")
+        return True
+
+    def click_checkbox():
+        """模拟真人点击 widget 左侧复选框区域"""
+        widget.scroll_into_view_if_needed()
+        time.sleep(0.3)
+        box = widget.bounding_box()
+        if not box:
+            raise RuntimeError("无法获取 cap-widget 位置")
+        cx = box["x"] + min(24, box["width"] / 4)
+        cy = box["y"] + box["height"] / 2
+        page.mouse.move(cx - 40, cy - 25)
+        time.sleep(0.15)
+        page.mouse.move(cx, cy, steps=6)
+        time.sleep(0.1)
+        page.mouse.click(cx, cy)
+
+    max_clicks = 3
+    clicked = 0
+    last_click = 0.0
+    start = time.time()
+
+    while time.time() - start < timeout_s:
+        if cap_token_ready():
+            print("  ✅ Cap 验证通过（PoW 求解完成，cap-token 已注入）")
+            time.sleep(0.5)
+            return True
+
+        has_error = False
+        try:
+            has_error = bool(page.evaluate("() => window.__capError"))
+        except Exception:
+            pass
+
+        # 首次点击；或出现错误；或点击后 20 秒仍无结果（可能未点中）→ 重新点击
+        if clicked < max_clicks and (clicked == 0 or has_error or time.time() - last_click > 20):
+            try:
+                click_checkbox()
+                clicked += 1
+                last_click = time.time()
+                page.evaluate("() => { window.__capError = false; }")
+                print(f"  👉 已点击 'Verify you're human' 复选框（第 {clicked} 次），等待 PoW 求解...")
+            except Exception as e:
+                print(f"  ⚠️ 鼠标点击失败: {e}，尝试 force click 兜底...")
+                try:
+                    widget.click(timeout=3000, force=True)
+                    clicked += 1
+                    last_click = time.time()
+                except Exception as e2:
+                    print(f"  ❌ force click 也失败: {e2}")
+        time.sleep(1.5)
+
+    if cap_token_ready():
+        print("  ✅ Cap 验证通过（最终确认）")
+        return True
+
+    print("  ❌ Cap 验证超时未完成")
+    try:
+        shadow_html = page.evaluate(
+            "() => { const w = document.querySelector('cap-widget'); "
+            "return w && w.shadowRoot ? w.shadowRoot.innerHTML.slice(0, 500) : '(no shadow)'; }")
+        print(f"  🔍 cap-widget Shadow DOM 片段: {shadow_html}")
+    except Exception:
+        pass
+    diagnostic_screenshot(page, "cap_widget_timeout")
+    return False
+
+
 def process_captcha(page, flow_name=""):
     """
     通用人机验证处理逻辑：
@@ -334,6 +451,14 @@ def process_captcha(page, flow_name=""):
             return False
     else:
         container = page
+
+    # ================= 1.5 优先处理 Cap.js (cap-widget) PoW 验证 =================
+    cap_result = solve_cap_widget(page)
+    if cap_result is True:
+        return True
+    if cap_result is False:
+        return False
+    # cap_result 为 None → 页面无 cap-widget，继续旧的图片点选验证逻辑
 
     # ================= 2. 点击人机验证复选框 =================
     try:
@@ -1176,7 +1301,7 @@ def main():
                 print(f"🌐 配置代理: {PROXY_SERVER}")
                 parsed_proxy = urlparse(PROXY_SERVER)
                 proxy_cfg = {"server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"}
-                if parsed_proxy.username and parsed_password:
+                if parsed_proxy.username and parsed_proxy.password:
                     proxy_cfg["username"] = parsed_proxy.username
                     proxy_cfg["password"] = parsed_proxy.password
                 launch_options["proxy"] = proxy_cfg
